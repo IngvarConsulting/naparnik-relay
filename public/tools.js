@@ -1,5 +1,4 @@
 const $ = id => document.getElementById(id);
-const pageSize = 3;
 const labels = new Map([
   ['mcp__syntax-checker__validate', 'Проверка синтаксиса'],
   ['mcp__knowledge-hub__Search_Documentation', 'Поиск по документации'],
@@ -42,28 +41,37 @@ function toolRow(name, call) {
 
 export function startToolMonitor(api) {
   const sources = [...document.querySelectorAll('.tool-sources button')];
-  const pager = document.querySelector('.tool-pager');
-  let snapshot, source = 'server', page = 0, polling = false, failed = false;
+  const list = $('tool-list');
+  let previousItems;
+  let snapshot, source = 'server', polling = false, failed = false;
 
   function render() {
     const server = source === 'server';
     const items = (server ? snapshot?.history : snapshot?.clients?.[source]) ?? [];
-    const pages = Math.ceil(items.length / pageSize);
-    page = Math.max(0, Math.min(page, pages - 1));
-    const visible = items.slice(page * pageSize, (page + 1) * pageSize);
     $('tool-kind').textContent = server ? 'Вызовы на сервере' : 'Инструменты, объявленные агентом';
     $('tool-total').textContent = snapshot ? String(items.length) : '';
-    $('tool-list').replaceChildren(...visible.map(item => server ? toolRow(item.name, item) : toolRow(item)));
+    list.hidden = failed || !items.length;
+    const signature = JSON.stringify(items);
+    if (signature !== previousItems) {
+      // Keep the first visible item in place when new calls arrive above it.
+      const offset = list.scrollTop;
+      const anchor = offset > 0 && [...list.children].find(row => row.offsetTop + row.offsetHeight > offset);
+      const inset = anchor ? offset - anchor.offsetTop : 0;
+      const rows = items.map(item => {
+        const row = server ? toolRow(item.name, item) : toolRow(item);
+        row.dataset.key = server ? JSON.stringify([item.name, item.protocol, item.time]) : item;
+        return row;
+      });
+      list.replaceChildren(...rows);
+      const match = anchor && rows.find(row => row.dataset.key === anchor.dataset.key);
+      if (match) list.scrollTop = match.offsetTop + inset;
+      previousItems = signature;
+    }
     const feedback = $('tool-feedback');
-    $('tool-list').hidden = failed;
     feedback.hidden = Boolean(items.length) && !failed;
     if (failed) feedback.textContent = 'Не удалось обновить список. Повторяем запрос…';
     else if (!snapshot) feedback.textContent = 'Загружаем инструменты…';
     else if (!items.length) feedback.textContent = server ? 'Серверных вызовов пока нет.' : 'Агент пока не передавал инструменты по этому протоколу.';
-    pager.hidden = failed || pages <= 1;
-    $('list-prev').disabled = page === 0;
-    $('list-next').disabled = page + 1 >= pages;
-    $('list-page').textContent = 'Страница ' + (page + 1) + ' из ' + pages;
   }
   async function poll() {
     if (polling || document.hidden || location.hash !== '#tools') return;
@@ -76,13 +84,13 @@ export function startToolMonitor(api) {
     render();
   }
   for (const button of sources) button.onclick = () => {
+    if (source === button.dataset.source) return;
     source = button.dataset.source;
     for (const tab of sources) tab.setAttribute('aria-pressed', String(tab === button));
-    page = 0;
+    list.scrollTop = 0;
+    previousItems = undefined;
     render();
   };
-  $('list-prev').onclick = () => { page--; render(); };
-  $('list-next').onclick = () => { page++; render(); };
   window.addEventListener('hashchange', poll);
   window.addEventListener('focus', poll);
   document.addEventListener('visibilitychange', poll);

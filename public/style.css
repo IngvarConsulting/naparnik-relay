@@ -100,12 +100,14 @@ progress::-moz-progress-bar { background: var(--green); }
 }
 .tools-link { text-decoration: none; }
 .back-link { color: var(--muted); text-decoration: none; font-size: 22px; padding: 0 5px; }
+#tools { max-width: none; height: 100vh; display: flex; flex-direction: column; }
 #tools-title:focus { outline: none; }
 .tool-sources { grid-template-columns: repeat(3, 1fr); margin: 7px 0 9px; }
 .tool-section { display: flex; align-items: baseline; gap: 7px; color: var(--green); }
 .tool-section h2 { font-size: 13px; font-weight: 650; }
 #tool-total { padding: 0 6px; border-radius: 5px; background: #eaf0ec; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-#tool-list { list-style: none; margin: 3px 0 0; padding: 0; }
+#tool-list { position: relative; min-height: 0; overflow-y: auto; overscroll-behavior: contain; list-style: none; margin: 3px 0 0; padding: 0; }
+#tool-list:focus-visible { outline: 2px solid #3475cd; outline-offset: 2px; }
 #tool-list li { display: flex; align-items: center; justify-content: space-between; gap: 9px; min-height: 39px; border-bottom: 1px solid var(--line); }
 #tool-list li > div:first-child { min-width: 0; }
 #tool-list strong, #tool-list code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -114,10 +116,3 @@ progress::-moz-progress-bar { background: var(--green); }
 .tool-meta { flex: none; display: grid; text-align: right; color: var(--muted); font-size: 11px; line-height: 15px; }
 .tool-meta time { font-size: 11.5px; font-variant-numeric: tabular-nums; }
 #tool-feedback { color: var(--muted); font-size: 12px; margin: 10px 0; }
-.tool-pager { display: flex; align-items: center; gap: 4px; padding-top: 6px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.tool-pager span { margin-right: auto; }
-.tool-pager button { display: grid; place-items: center; width: 30px; height: 24px; background: transparent; border: 1px solid var(--line); border-radius: 6px; }
-.tool-pager i { width: 7px; height: 7px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(135deg); }
-#list-next i { transform: rotate(-45deg); }
-.tool-pager button:not(:disabled):hover { background: #e9ede9; }
-.tool-pager button:disabled { opacity: .4; }
