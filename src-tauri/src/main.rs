@@ -95,6 +95,13 @@ fn open_external(app: &AppHandle, target: &tauri::Url) {
     }
 }
 
+fn panel_title(app: &AppHandle) -> String {
+    format!(
+        "Напарник {} · Ingvar Consulting",
+        app.package_info().version
+    )
+}
+
 fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = app.path().resource_dir()?.join("runtime");
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
@@ -131,7 +138,7 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.clone();
     let popup_handle = app.clone();
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
-        .title("Напарник · Ingvar Consulting")
+        .title(panel_title(app))
         .inner_size(440., 300.)
         .min_inner_size(350., 300.)
         .center()
@@ -185,9 +192,10 @@ async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error +
         ))
         .blocking_show();
     if install {
-        let _ = window.set_title("Загружаем обновление…");
+        let title = panel_title(app);
+        let _ = window.set_title(&format!("{title} — Загружаем обновление…"));
         let result = update.download_and_install(|_, _| {}, || {}).await;
-        let _ = window.set_title("Напарник · Ingvar Consulting");
+        let _ = window.set_title(&title);
         result?;
         app.state::<Service>().stop();
         app.restart();
@@ -214,6 +222,11 @@ fn main() {
                 MenuItem::with_id(app, "updates", "Проверить обновления…", true, None::<&str>)?;
             let quit = PredefinedMenuItem::quit(app, Some("Завершить Naparnik Relay"))?;
             let relay = Submenu::with_items(app, "Naparnik Relay", true, &[&update, &quit])?;
+            #[cfg(target_os = "macos")]
+            relay.insert(
+                &PredefinedMenuItem::close_window(app, Some("Закрыть окно"))?,
+                1,
+            )?;
             let edit = Submenu::with_items(
                 app,
                 "Правка",
