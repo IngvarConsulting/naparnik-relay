@@ -189,7 +189,8 @@ export function createServer({ connection = load(), upstream, persist = save, mo
         if (path === '/v1/models' && method === 'GET')
           return send({
             object: 'list',
-            data: [{ id: MODEL, object: 'model', created: 0, owned_by: 'naparnik-relay' }]
+            data: [{ id: MODEL, object: 'model', created: 0, owned_by: 'naparnik-relay',
+              ...(bridge.contextWindow ? { context_length: bridge.contextWindow } : {}) }]
           });
         if ((anthropic || path === '/v1/chat/completions') && method === 'POST') {
           if (!key) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
@@ -197,7 +198,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             payload = normalize(input, anthropic);
           const protocol = anthropic ? 'Anthropic' : 'OpenAI';
           monitor.observe(protocol, (Array.isArray(input.tools) ? input.tools : []).map(t => (anthropic ? t : t?.function)?.name).filter(n => typeof n === 'string'));
-          const format = completion(res, anthropic, input.stream === true, payload.messages);
+          const format = completion(res, anthropic, input.stream === true, input.stream_options?.include_usage === true);
           const abort = new AbortController();
           res.on('close', () => {
             if (!res.writableEnded) abort.abort();
@@ -210,7 +211,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             const answer = await bridge.generate(key, payload, signal, format.part, (name) => {
               format.waiting();
               monitor.serverCall(protocol, name);
-            });
+            }, format.metrics);
             format.finish(answer);
           } catch (e) {
             outcome = abort.signal.aborted ? 'Отменён' : e.message;

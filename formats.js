@@ -17,7 +17,7 @@ function blocks(part) {
   }
   return result;
 }
-export function completion(res, anthropic, stream, messages) {
+export function completion(res, anthropic, stream, includeUsage) {
   const id = (anthropic ? 'msg_' : 'chatcmpl-') + randomUUID();
   const base = { id, model: MODEL };
   const created = Math.floor(Date.now() / 1000);
@@ -25,9 +25,16 @@ export function completion(res, anthropic, stream, messages) {
     index = 0,
     callIndex = 0,
     timer;
-  // Anthropic requires numeric usage. The public API only reports account limits.
-  const estimate = (value) => Math.ceil([...value].length / 4);
-  const inputTokens = estimate(JSON.stringify(messages));
+  let usage, context;
+  const contextField = () => context ? { naparnik_context: context } : {};
+  const anthropicUsage = () => {
+    const cached = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    return {
+      input_tokens: usage ? usage.prompt_tokens - cached : 0,
+      cache_read_input_tokens: cached,
+      output_tokens: usage?.completion_tokens ?? 0
+    };
+  };
   const frame = (data) =>
     res.write((anthropic ? 'event: ' + data.type + '\n' : '') + 'data: ' + JSON.stringify(data) + '\n\n');
   const chunk = (delta, finish_reason = null) =>
@@ -35,16 +42,19 @@ export function completion(res, anthropic, stream, messages) {
       ...base,
       created,
       object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta, finish_reason }]
+      choices: [{ index: 0, delta, finish_reason }],
+      ...(includeUsage ? { usage: null } : {}),
+      ...(finish_reason ? contextField() : {})
     });
-  const message = (content, stop_reason, output_tokens) => ({
+  const message = (content, stop_reason, starting = false) => ({
     ...base,
     type: 'message',
     role: 'assistant',
     content,
     stop_reason,
     stop_sequence: null,
-    usage: { input_tokens: inputTokens, output_tokens }
+    usage: { ...anthropicUsage(), ...(starting ? {output_tokens: 0} : {}) },
+    ...contextField()
   });
   function start() {
     if (started) return;
@@ -54,12 +64,13 @@ export function completion(res, anthropic, stream, messages) {
       'Cache-Control': 'no-cache',
       'X-Accel-Buffering': 'no'
     });
-    if (anthropic) frame({ type: 'message_start', message: message([], null, 0) });
+    if (anthropic) frame({ type: 'message_start', message: message([], null, true) });
     else chunk({ role: 'assistant', content: '' });
     timer = setInterval(() => res.write(': ping\n\n'), 15000);
     res.once('close', () => clearInterval(timer));
   }
   return {
+    metrics(providerUsage, branchContext) { usage = providerUsage; context = branchContext; },
     waiting() { if (stream) start(); },
     part(part) {
       if (!stream) return;
@@ -84,18 +95,19 @@ export function completion(res, anthropic, stream, messages) {
     finish(reply) {
       const tools = reply.calls.length > 0;
       const reason = anthropic ? (tools ? 'tool_use' : 'end_turn') : tools ? 'tool_calls' : 'stop';
-      const output = estimate(reply.content + reply.calls.map((c) => c.args).join(''));
       if (stream) {
         start();
         if (anthropic) {
           frame({
             type: 'message_delta',
             delta: { stop_reason: reason, stop_sequence: null },
-            usage: { output_tokens: output }
+            usage: anthropicUsage(),
+            ...contextField()
           });
           frame({ type: 'message_stop' });
         } else {
           chunk({}, reason);
+          if (includeUsage && usage) frame({ ...base, created, object: 'chat.completion.chunk', choices: [], usage, ...contextField() });
           res.write('data: [DONE]\n\n');
         }
         clearInterval(timer);
@@ -103,11 +115,13 @@ export function completion(res, anthropic, stream, messages) {
         return;
       }
       const result = anthropic
-        ? message(blocks(reply), reason, output)
+        ? message(blocks(reply), reason)
         : {
             ...base,
             created,
             object: 'chat.completion',
+            ...(usage ? {usage} : {}),
+            ...contextField(),
             choices: [
               {
                 index: 0,

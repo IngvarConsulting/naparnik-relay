@@ -21,6 +21,10 @@ test('Оба клиента, ключи, история, поток и ошиб�
       res.end(JSON.stringify({ uuid: 'chat-' + ++id }));
       return;
     }
+    if (req.url.includes('/context_tokens?branch=')) {
+      assert.match(req.url, /branch=answer$/);
+      return res.end(JSON.stringify({token_count: 101, max_context_length: 384000}));
+    }
     let raw = '';
     for await (const p of req) raw += p;
     const body = JSON.parse(raw);
@@ -45,7 +49,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
       body.content === 'tool'
         ? { tool_calls: [{ id: 'call-1', function: { name: body.tools[0].name, arguments: '{"x":1}' } }] }
         : { content: 'Готово' };
-    event({ uuid: 'answer', role: 'assistant', finished: true, content });
+    event({ uuid: 'answer', role: 'assistant', finished: true, content, usage: {prompt_tokens:90, cached_tokens:64, completion_tokens:10, total_tokens:100}, details:{max_context_length:384000} });
     res.end();
   });
   mock.listen(0, '127.0.0.1');
@@ -88,6 +92,8 @@ test('Оба клиента, ключи, история, поток и ошиб�
   const messages = [{ role: 'user', content: 'tool' }];
   const post = (path, body, headers) => request('/v1/' + path, { model: 'naparnik', ...body }, headers);
   const result = await (await post('chat/completions', { messages, tools }, oa)).json();
+  assert.deepEqual(result.naparnik_context, {token_count:101,max_context_length:384000});
+  assert.equal(result.usage.total_tokens,100);
   const reply = result.choices[0].message;
   assert.equal(result.choices[0].finish_reason, 'tool_calls');
   assert.equal(reply.tool_calls[0].function.name, 'lookup');
@@ -98,12 +104,14 @@ test('Оба клиента, ключи, история, поток и ошиб�
       {
         messages: [...messages, reply, { role: 'tool', tool_call_id: 'call-1', content: '42' }],
         tools,
+        stream_options: {include_usage:true},
         stream: true
       },
       oa
     )
   ).text();
   assert.match(next, /Готово/);
+  assert.match(next, /"choices":\[\],"usage":\{"prompt_tokens":90/);
   assert.match(next, /\[DONE\]/);
   assert.doesNotMatch(next, /Черновик/);
   assert.equal(received[1].url, received[0].url);
@@ -111,6 +119,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.deepEqual(received[1].body.content, [{ tool_call_id: 'call-1', content: '42', status: 'ok' }]);
   const aTools = [{ name: 'lookup', input_schema: { type: 'object' } }];
   const a = await (await post('messages', { messages, tools: aTools, max_tokens: 50 }, an)).json();
+  assert.deepEqual(a.usage, {input_tokens:26, cache_read_input_tokens:64, output_tokens:10});
   assert.deepEqual(a.content, [{ type: 'tool_use', name: 'lookup', id: 'call-1', input: { x: 1 } }]);
   const s = await (
     await post(
@@ -129,6 +138,11 @@ test('Оба клиента, ключи, история, поток и ошиб�
   ).text();
   assert.match(s, /event: message_stop/);
   assert.match(s, /text_delta/);
+  const events = s.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
+  assert.deepEqual(events.find(event => event.type === 'message_delta').usage, a.usage);
+  assert.equal(events.find(event => event.type === 'message_delta').naparnik_context.token_count, 101);
+  const models = await (await request('/v1/models', undefined, oa)).json();
+  assert.equal(models.data[0].context_length, 384000);
   assert.equal(received.at(-1).body.role, 'tool');
   assert.equal(received.at(-1).url, received.at(-2).url);
   const inventory = await (await request('/panel/tools', undefined, header)).json();

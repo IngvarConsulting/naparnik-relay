@@ -163,6 +163,18 @@ function upstreamFault(status, data) {
   const code = data?.error_type || 'upstream_error';
   return new Fault(status, code, errorMessages[code] || 'Ошибка Напарника (' + code + ').');
 }
+const tokenCount = n => Number.isSafeInteger(n) && n >= 0;
+function providerUsage(value) {
+  if (!value || ![value.prompt_tokens, value.completion_tokens, value.total_tokens].every(tokenCount)) return null;
+  const { prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens } = value;
+  return {
+    prompt_tokens, completion_tokens, total_tokens,
+    ...(tokenCount(cached_tokens) && cached_tokens <= prompt_tokens
+      ? { prompt_tokens_details: { cached_tokens } } : {}),
+    ...(tokenCount(reasoning_tokens) && reasoning_tokens <= completion_tokens
+      ? { completion_tokens_details: { reasoning_tokens } } : {})
+  };
+}
 export class Bridge {
   constructor(base = 'https://code.1c.ai/public/v1') {
     this.base = base;
@@ -195,7 +207,7 @@ export class Bridge {
       throw new Fault(502, 'bad_budget', 'Напарник вернул неизвестный формат лимитов.');
     return limits;
   }
-  async generate(key, { messages, tools }, signal, onPart, onServerCall = () => {}) {
+  async generate(key, { messages, tools }, signal, onPart, onServerCall = () => {}, onMetrics) {
     // The provider reserves tool names (including ZCode's TodoWrite). Give
     // client tools their own wire names and restore them in public responses.
     signal = AbortSignal.any([signal, AbortSignal.timeout(600000)]);
@@ -246,6 +258,7 @@ export class Bridge {
     }
     const reviewed = new Set((previous?.serverDecisions ?? []).map((item) => item.tool_call_id));
     let serverDecisions = [];
+    let lastAssistant, usage, context;
     let text = '',
       calls = [];
     for (const [i, turn] of turns.entries()) {
@@ -275,6 +288,12 @@ export class Bridge {
         if (p.role === 'tool') serverCalls.delete(p.content?.tool_call_id ?? p.details?.tool_call_id);
         if (!last || p.role !== 'assistant' || !p.content) continue;
         answered = true;
+        lastAssistant = p.uuid;
+        usage = providerUsage(p.usage);
+        const capacity = p.details?.max_context_length;
+        context = usage && tokenCount(capacity) && capacity > 0
+          ? { token_count: usage.total_tokens, max_context_length: capacity } : null;
+        onMetrics?.(usage, context);
         const part = assistant(p.content.content, p.content.tool_calls ?? []);
         // A later assistant message in the same stream supersedes the earlier tool request.
         serverCalls.clear();
@@ -305,6 +324,21 @@ export class Bridge {
       if (serverDecisions.length && !calls.length) {
         turns.push({ role: 'tool', content: serverDecisions });
       }
+    }
+    if (onMetrics && lastAssistant) {
+      // Pin the query to this answer: concurrent branches can have different sizes.
+      const path = '/conversations/' + encodeURIComponent(conversation) +
+        '/context_tokens?branch=' + encodeURIComponent(lastAssistant);
+      try {
+        const response = await this.request(key, path, undefined, AbortSignal.any([signal, AbortSignal.timeout(2500)]));
+        const measured = await response.json();
+        if (tokenCount(measured.token_count) && tokenCount(measured.max_context_length) && measured.max_context_length > 0)
+          context = { token_count: measured.token_count, max_context_length: measured.max_context_length };
+      } catch {
+        signal.throwIfAborted(); // Optional statistics must not discard an otherwise complete answer.
+      }
+      if (context) this.contextWindow = context.max_context_length;
+      onMetrics(usage, context);
     }
     const reply = { role: 'assistant', content: text, calls };
     this.history.set(fingerprint([...messages, reply]), { conversation, parent, serverDecisions, clientNames: knownClientNames });
