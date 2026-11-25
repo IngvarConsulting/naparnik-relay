@@ -3,7 +3,6 @@ import http.cookiejar
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import socket
 import subprocess
@@ -14,7 +13,7 @@ import urllib.request
 
 dist = Path(sys.argv[1]).resolve()
 with tempfile.TemporaryDirectory() as tmp:
-    root = Path(tmp)
+    root = Path(tmp).resolve()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -44,6 +43,8 @@ with tempfile.TemporaryDirectory() as tmp:
     url = f"http://127.0.0.1:{port}"
     try:
         for _ in range(150):
+            if proc.poll() is not None:
+                raise RuntimeError(f"Desktop exited during startup: {proc.returncode}")
             try:
                 with urllib.request.urlopen(url + "/health", timeout=1) as r:
                     if json.load(r)["service"] == "naparnik-relay":

@@ -23,179 +23,57 @@ async function api(path, method = 'GET', data) {
   if (!res.ok) throw Error(value.error?.message || 'Ошибка подключения.');
   return value;
 }
-function draw(connected) {
-  const ctx = $('cable').getContext('2d');
-  ctx.resetTransform();
-  ctx.clearRect(0, 0, 960, 420);
-  ctx.scale(2, 2);
-  ctx.translate(244, 103);
-  ctx.rotate(-0.27);
-  // Machined collars and two exposed contacts move together when the link is live.
-  function metal(x, y, w, h, colors, r = 4) {
-    const grad = ctx.createLinearGradient(0, y, 0, y + h);
-    colors.forEach(([p, c]) => grad.addColorStop(p, c));
-    ctx.beginPath();
-    ctx.roundRect(x, y, w, h, r);
-    ctx.fillStyle = grad;
-    ctx.fill();
-  }
-  const rubber = [
-    [0, '#1b3430'],
-    [0.13, '#6b8375'],
-    [0.35, '#38594b'],
-    [0.64, '#243f35'],
-    [1, '#0e2721']
-  ];
-  const body = [
-    [0, '#accb9c'],
-    [0.07, '#e0f0b5'],
-    [0.23, '#d7eab2'],
-    [0.45, '#bfd59e'],
-    [0.52, '#a8c18a'],
-    [0.85, '#91ac77'],
-    [1, '#718e65']
-  ];
-  const steel = [
-    [0, '#719180'],
-    [0.17, '#e0eade'],
-    [0.35, '#f1f3de'],
-    [0.44, '#addebd'],
-    [0.66, '#788d7c'],
-    [1, '#405c51']
-  ];
-  const gold = [
-    [0, '#ab9558'],
-    [0.22, '#fff0ac'],
-    [0.39, '#efd991'],
-    [0.72, '#b79b5e'],
-    [1, '#716948']
-  ];
-  function end(female) {
-    ctx.save();
-    if (female) ctx.scale(-1, 1);
-    ctx.translate(connected ? 18 : -12, 0);
-    metal(-350, -11, 247, 22, rubber, 7);
-    metal(-154, -19, 52, 38, rubber, 7);
-    for (let i = 0; i < 5; i++) metal(-151 + i * 8, -18 - i * 0.5, 4, 36 + i, rubber, 1);
-    metal(-118, -29, 66, 58, body, 8);
-    metal(-65, -32, 37, 64, body, 5);
-    for (let i = 0; i < 6; i++)
-      metal(
-        -62 + i * 5,
-        -30,
-        2,
-        60,
-        [
-          [0, '#c7ddaa'],
-          [0.55, '#94aa80'],
-          [1, '#6c8668']
-        ],
-        1
-      );
-    if (female) metal(-29, -25, 12, 50, rubber, 3);
-    else {
-      metal(-29, -20, 22, 40, steel, 2);
-      metal(-8, -11, 22, 22, gold, 2);
-      metal(7, -11, 2, 22, rubber, 1);
-    }
-    ctx.restore();
-  }
-  end(false);
-  end(true);
-}
 function pick(p) {
   profile = p;
   const z = p === 'zcode';
   for (const name of ['zcode', 'dsh']) $(name).setAttribute('aria-pressed', String(name === p));
-  $('guide').textContent = z
-    ? 'Model settings → Add provider → Create custom provider. Выберите формат Chat Completions.'
-    : 'Settings → Models → DeepSeek → Customized settings. Вставьте Base URL и локальный ключ, затем нажмите Add model.';
-  $('tip').textContent = z
-    ? 'Добавьте модель по её ID и нажмите Test model.'
-    : 'Укажите naparnik в поле ID, любое название во втором поле. Нажмите Apply и выберите эту модель в сессии.';
   $('url').textContent = (state?.origin || location.origin) + (z ? '/v1' : '');
 }
 function render(data) {
   state = data;
   const ok = data.configured && data.limits && !data.problem;
   const exhausted = ok && Object.values(data.limits).some((x) => x.used_percent >= 100);
-  $('headline').textContent = data.problem
-    ? 'Нужна проверка'
-    : exhausted
-      ? 'Лимит исчерпан'
-      : ok
-        ? 'Аккаунт подключён'
-        : data.configured
-          ? 'Проверяем аккаунт'
-          : 'Подключите Напарника';
-  $('subtitle').textContent =
-    data.problem?.message ||
-    (exhausted
-      ? 'Дождитесь обновления лимита.'
-      : ok
-        ? 'Шлюз готов принимать запросы от ваших ИИ-клиентов.'
-        : data.configured
-          ? 'Запрашиваем состояние лимитов.'
-          : 'Введите API-ключ, чтобы использовать модель в своём ИИ-клиенте.');
-  $('local').textContent = 'Шлюз запущен';
-  $('local').classList.remove('off');
-  $('actions').hidden = false;
-  $('manage').textContent = data.configured ? 'Настроить аккаунт' : 'Подключить аккаунт';
+  $('headline').textContent = data.problem ? 'Проверить связь' : exhausted ? 'Лимит исчерпан' :
+    ok ? 'Подключено' : data.configured ? 'Проверяем…' : 'Подключить';
+  $('home').classList.remove('offline');
+  $('quota').hidden = false;
+  $('subtitle').hidden = true;
+  $('manage').disabled = false;
+  $('manage').title = data.configured ? 'Настроить аккаунт' : 'Подключить аккаунт';
+  $('manage').classList.toggle('ready', Boolean(ok && !exhausted));
   $('refresh').hidden = !data.configured;
-  $('signal').classList.toggle('on', Boolean(ok && !exhausted));
   $('model').textContent = data.model;
   for (const button of document.querySelectorAll('.copy')) button.disabled = false;
-  for (const [id, field] of [
-    ['hours', 'sliding_5h'],
-    ['week', 'weekly']
-  ]) {
-    const limit = data.limits?.[field];
-    $(id + '-value').textContent = limit
-      ? limit.used_percent.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + ' %'
-      : '—';
-    $(id).value = limit?.used_percent || 0;
-    $(id + '-reset').textContent = limit?.resets_at
-      ? 'Обновится ' +
-        new Date(limit.resets_at).toLocaleString('ru-RU', {
-          day: 'numeric',
-          month: 'short',
-          hour: '2-digit',
-          minute: '2-digit'
-        })
-      : '';
-  }
-  $('checked').textContent = data.checked
-    ? 'Проверено в ' + new Date(data.checked).toLocaleTimeString('ru-RU') + ' · Использованная доля лимита'
-    : 'Лимиты появятся после подключения аккаунта.';
-  $('empty').hidden = Boolean(data.recent.length);
-  $('counter').textContent = data.recent.length ? String(data.recent.length) : '';
-  $('rows').replaceChildren(
-    ...data.recent.map((r) => {
-      const li = document.createElement('li');
-      for (const text of [
-        new Date(r.time).toLocaleTimeString('ru-RU'),
-        r.protocol,
-        r.outcome,
-        (r.duration / 1000).toFixed(1) + ' с'
-      ]) {
-        const span = document.createElement('span');
-        span.textContent = text;
-        li.append(span);
-      }
-      return li;
-    })
-  );
-  draw(Boolean(ok && !exhausted));
+  renderLimits(data.problem ? null : data.limits, data.configured);
   pick(profile);
 }
+function renderLimits(limits, configured) {
+  const hint = [];
+  for (const [id, field, label] of [['hours', 'sliding_5h', 'За 5 часов'], ['week', 'weekly', 'За неделю']]) {
+    const limit = limits?.[field];
+    const value = Number.isFinite(limit?.used_percent) ? limit.used_percent : null;
+    const percent = value === null ? 0 : Math.max(0, Math.min(100, value));
+    const display = value === null ? '—' : value.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + ' %';
+    $(id + '-value').textContent = display;
+    $(id + '-ring').setAttribute('stroke-dasharray', percent + ' ' + (100 - percent));
+    $(id).value = percent;
+    $(id + '-reset').textContent = limit?.resets_at ? 'Обновится ' +
+      new Date(limit.resets_at).toLocaleString('ru-RU', {day:'numeric', month:'short',hour:'2-digit',minute:'2-digit'}) : '';
+    hint.push(label + ': ' + display);
+  }
+  $('quota').querySelector('summary').title = hint.join(' · ');
+  $('quota-note').textContent = limits ? '' : configured ? 'Лимиты временно недоступны.' : 'Подключите аккаунт, чтобы увидеть лимиты.';
+}
 function offline(e) {
+  $('home').classList.add('offline');
+  $('quota').open = false;
+  $('quota').hidden = true;
   $('headline').textContent = 'Панель недоступна';
   $('subtitle').textContent = e.message;
-  $('local').textContent = 'Нет подключения';
-  $('local').classList.add('off');
-  $('actions').hidden = true;
-  $('signal').classList.remove('on');
-  draw(false);
+  $('subtitle').hidden = false;
+  $('manage').disabled = true;
+  $('manage').classList.remove('ready');
+  renderLimits(null, Boolean(state?.configured));
   for (const button of document.querySelectorAll('.copy')) button.disabled = true;
 }
 for (const name of ['zcode', 'dsh']) $(name).onclick = () => pick(name);
@@ -209,24 +87,40 @@ for (const button of document.querySelectorAll('.copy'))
       toast('Браузер заблокировал буфер обмена. Разрешите копирование.');
     }
   };
-$('manage').onclick = () => {
+function showPage() {
+  const auth = location.hash === '#account' && Boolean(state);
+  $('home').hidden = auth;
+  $('auth').hidden = !auth;
+  $('quota').open = false;
   $('account').reset();
   $('error').textContent = '';
-  $('remember').checked = state.saved;
-  $('modal-title').textContent = state.configured ? 'Настроить аккаунт' : 'Подключить аккаунт';
-  $('unlink').hidden = !state.configured;
-  $('dialog').showModal();
-  $('secret').focus();
-};
-$('close').onclick = () => $('dialog').close();
-$('dialog').onclose = () => {
-  $('secret').value = '';
-};
+  if (auth) {
+    $('remember').checked = state.saved;
+    $('auth-state').textContent = state.problem?.message || (state.configured ? 'Аккаунт подключён' : 'Подключите аккаунт по API-ключу.');
+    $('unlink').hidden = !state.configured;
+    $('secret').placeholder = state.configured ? 'Введите новый ключ' : 'Вставьте ключ';
+    $('connect').textContent = state.configured ? 'Заменить ключ' : 'Подключить';
+    $('auth-title').focus();
+  } else {
+    $('manage').focus({preventScroll:true});
+  }
+}
+$('manage').onclick = () => { location.hash = 'account'; };
+window.addEventListener('hashchange', showPage);
+document.addEventListener('click', event => {
+  if (!$('quota').contains(event.target)) $('quota').open = false;
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('quota').open) {
+    $('quota').open = false;
+    $('quota').querySelector('summary').focus();
+  }
+});
 async function account(remove) {
   pending = true;
   $('connect').disabled = $('unlink').disabled = true;
   $('error').textContent = '';
-  $('connect').textContent = 'Проверяем…';
+  $('connect').textContent = remove ? 'Отключаем…' : 'Проверяем…';
   try {
     render(
       await api(
@@ -235,14 +129,15 @@ async function account(remove) {
         remove ? undefined : { key: $('secret').value, remember: $('remember').checked }
       )
     );
-    $('dialog').close();
+    $('secret').value = '';
+    location.hash = 'home';
     toast(remove ? 'Аккаунт отключён' : 'Аккаунт подключён');
   } catch (e) {
     $('error').textContent = e.message;
   } finally {
     pending = false;
     $('connect').disabled = $('unlink').disabled = false;
-    $('connect').textContent = 'Проверить и подключить';
+    $('connect').textContent = state?.configured ? 'Заменить ключ' : 'Подключить';
   }
 }
 $('account').onsubmit = (e) => {
@@ -267,16 +162,17 @@ async function update(check = false) {
 }
 $('refresh').onclick = () => update(true);
 pick(profile);
-draw(false);
+
 try {
   const token = location.hash.slice(1);
-  if (token) {
+  if (token && token !== 'account' && token !== 'home') {
     history.replaceState(null, '', location.pathname);
     await api('session', 'POST', { token });
   }
   await update(true);
+  if (location.hash === '#account') showPage();
   setInterval(() => {
-    if (!document.hidden && !$('dialog').open)
+    if (!document.hidden && $('auth').hidden)
       update(Boolean(state?.configured && Date.now() - new Date(state.checked).getTime() > 60000));
   }, 5000);
 } catch (e) {

@@ -39,7 +39,7 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .arg(runtime.join("desktop-server.js"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -66,15 +66,20 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.clone();
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
         .title("Напарник · Ingvar Consulting")
-        .inner_size(1080., 800.)
-        .min_inner_size(570., 460.)
+        .inner_size(440., 300.)
+        .min_inner_size(350., 300.)
         .center()
         .on_navigation(move |next| next.origin() == origin)
         .on_new_window(move |target, _| {
             if target.scheme() == "https"
                 && matches!(target.host_str(), Some("code.1c.ai" | "ingvar.pro"))
             {
-                let _ = handle.opener().open_url(target.as_str(), None::<&str>);
+                if let Err(error) = handle.opener().open_url(target.as_str(), None::<&str>) {
+                    handle
+                        .dialog()
+                        .message(format!("Не удалось открыть браузер. {error}"))
+                        .show(|_| {});
+                }
             }
             NewWindowResponse::Deny
         })
@@ -138,7 +143,11 @@ fn main() {
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .manage(Service::default())
         .manage(AtomicBool::new(false))
         .menu(|app| {
@@ -178,6 +187,7 @@ fn main() {
         })
         .setup(|app| {
             if let Err(e) = open_panel(app.handle()) {
+                eprintln!("Не удалось открыть панель: {e}");
                 app.state::<Service>().stop();
                 let handle = app.handle().clone();
                 app.dialog()
