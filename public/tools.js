@@ -50,9 +50,14 @@ export function startToolMonitor(api) {
     const sessions = snapshot?.sessions ?? [];
     const keyOf = s => JSON.stringify([s.protocol, s.id]);
     const options = sessions.map(s => {
-      const id = s.id.length > 18 ? '…' + s.id.slice(-12) : s.id;
       const when = new Date(s.updated).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-      return [keyOf(s), s.protocol + ' · ' + when + ' · ' + id];
+      const agent = s.agent || ('Клиент ' + s.protocol);
+      return [keyOf(s), agent + ' · ' + (s.title?.trim() || 'Чат без названия · ' + when)];
+    });
+    const counts = new Map();
+    for (const [, label] of options) counts.set(label, (counts.get(label) || 0) + 1);
+    options.forEach((option, i) => {
+      if (counts.get(option[1]) > 1) option[1] += ' · …' + sessions[i].id.slice(-8);
     });
     options.push(['', 'Без сессии']);
     const optionSignature = JSON.stringify(options);
@@ -62,6 +67,7 @@ export function startToolMonitor(api) {
     }
     if (selected === undefined && sessions.length) selected = options[0][0];
     picker.value = selected ?? '';
+    picker.title = picker.selectedOptions[0]?.text || '';
     const session = sessions.find(s => keyOf(s) === picker.value);
     if (session && source !== 'server' && source !== session.protocol) source = session.protocol;
     for (const tab of sources) {

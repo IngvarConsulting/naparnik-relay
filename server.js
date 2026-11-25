@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { Bridge, Fault, MODEL, normalize, requireInput } from './bridge.js';
 import { completion } from './formats.js';
 import { join } from 'node:path';
+import { SessionTitles } from './session-titles.js';
 import { ToolMonitor } from './tool-monitor.js';
 import { load, save, port, origin, dir } from './state.js';
 
@@ -32,6 +33,7 @@ async function body(req) {
   }
 }
 export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor() } = {}) {
+  const sessionTitles = new SessionTitles();
   let bridge = new Bridge(upstream),
     key = connection.upstream,
     busy = false,
@@ -140,7 +142,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           server.close();
           return;
         }
-        if (path === '/panel/tools' && method === 'GET') return send(monitor.records);
+        if (path === '/panel/tools' && method === 'GET') return send(await sessionTitles.snapshot(monitor.records));
         if (path === '/panel/state' && method === 'GET') return send(status());
         if (path === '/panel/refresh' && method === 'POST') {
           await check();
@@ -201,7 +203,9 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           const declared = Array.isArray(input.tools)
             ? input.tools.map(t => (anthropic ? t : t?.function)?.name).filter(name => typeof name === 'string')
             : undefined;
-          const session = monitor.observe(protocol, declared, sessionId?.trim());
+          const agent = anthropic && req.headers['x-deepseek-harness-session-id'] ? 'DeepSeek Harness'
+            : !anthropic && req.headers['x-zcode-session-type'] ? 'ZCode' : undefined;
+          const session = monitor.observe(protocol, declared, sessionId?.trim(), agent);
           const format = completion(res, anthropic, input.stream === true, input.stream_options?.include_usage === true);
           const abort = new AbortController();
           res.on('close', () => {

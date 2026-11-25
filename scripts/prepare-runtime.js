@@ -33,7 +33,7 @@ try {
   await copyFile(join(tmp,name,file),join(dest,binary));
   await chmod(join(dest,binary),0o755);
   await copyFile(join(tmp,name,'LICENSE'), join(dest,'NODE-LICENSE'));
-  for (const f of ['bridge.js','formats.js','server.js','state.js','tool-monitor.js','desktop-server.js']) await copyFile(join(root,f), join(dest,f));
+  for (const f of ['bridge.js','formats.js','server.js','state.js','tool-monitor.js','session-titles.js','desktop-server.js']) await copyFile(join(root,f), join(dest,f));
   await cp(join(root,'public'),join(dest,'public'),{recursive:true});
   await writeFile(join(dest,'package.json'),JSON.stringify({type:'module'}));
 } finally { await rm(tmp,{recursive:true,force:true}); }

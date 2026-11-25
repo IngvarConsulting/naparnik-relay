@@ -28,7 +28,7 @@ export class ToolMonitor {
     }
   }
 
-  observe(protocol, names, sessionId) {
+  observe(protocol, names, sessionId, agent) {
     if (sessionId) {
       const sessions = this.records.sessions;
       const index = sessions.findIndex(s => s.protocol === protocol && s.id === sessionId);
@@ -38,6 +38,7 @@ export class ToolMonitor {
       // Harness also sends title requests in this session without a tool declaration.
       session.lastRequestDeclaredTools = names !== undefined;
       if (session.lastRequestDeclaredTools) session.tools = [...new Set(names)].sort();
+      if (agent) session.agent = agent;
       session.updated = new Date().toISOString();
       sessions.unshift(session);
       this.save();
