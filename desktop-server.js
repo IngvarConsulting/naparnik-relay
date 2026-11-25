@@ -1,6 +1,28 @@
 // Private startup channel between the native window and its child process.
-import { createServer } from './server.js';
-import { load, origin, port } from './state.js';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+// A saved desktop profile keeps the same address and client key after a Finder
+// launch or an update. Explicit overrides are reserved for isolated instances.
+if (!process.env.RELAY_PORT && !process.env.RELAY_DATA_DIR) {
+  const profile = join(homedir(), '.naparnik-relay', 'desktop');
+  try {
+    const port = readFileSync(join(profile, 'port'), 'utf8').trim();
+    if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535)
+      throw Error('Некорректный порт в сохранённом профиле Naparnik Relay.');
+    process.env.RELAY_PORT = port;
+    process.env.RELAY_DATA_DIR = profile;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      process.stdout.write(JSON.stringify({error: error.message}) + '\n');
+      process.exit(1);
+    }
+  }
+}
+
+const { createServer } = await import('./server.js');
+const { load, origin, port } = await import('./state.js');
 
 const connection = load();
 const server = createServer({connection});
