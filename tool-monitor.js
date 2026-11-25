@@ -33,9 +33,11 @@ export class ToolMonitor {
       const sessions = this.records.sessions;
       const index = sessions.findIndex(s => s.protocol === protocol && s.id === sessionId);
       const session = index < 0
-        ? { id: sessionId, protocol, history: [] }
+        ? { id: sessionId, protocol, history: [], tools: [] }
         : sessions.splice(index, 1)[0];
-      session.tools = [...new Set(names)].sort();
+      // Harness also sends title requests in this session without a tool declaration.
+      session.lastRequestDeclaredTools = names !== undefined;
+      if (session.lastRequestDeclaredTools) session.tools = [...new Set(names)].sort();
       session.updated = new Date().toISOString();
       sessions.unshift(session);
       this.save();
@@ -44,7 +46,7 @@ export class ToolMonitor {
     // Records made without a session ID are a historical inventory.
     const current = new Set(this.records.clients[protocol]);
     const size = current.size;
-    for (const name of names) current.add(name);
+    for (const name of names ?? []) current.add(name);
     if (current.size !== size) {
       this.records.clients[protocol] = [...current].sort();
       this.save();

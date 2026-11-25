@@ -71,7 +71,7 @@ export function startToolMonitor(api) {
     const server = source === 'server';
     const items = server ? (session?.history ?? snapshot?.history ?? [])
       : session ? session.tools : (snapshot?.clients?.[source] ?? []);
-    $('tool-kind').textContent = server ? 'Вызовы на сервере' : session ? 'Инструменты последнего запроса' : 'Все объявленные инструменты';
+    $('tool-kind').textContent = server ? 'Вызовы на сервере' : session ? 'Последний объявленный набор' : 'Все объявленные инструменты';
     $('tool-total').textContent = snapshot ? String(items.length) : '';
     list.hidden = failed || !items.length;
     const signature = JSON.stringify(items);
@@ -91,9 +91,11 @@ export function startToolMonitor(api) {
       previousItems = signature;
     }
     const feedback = $('tool-feedback');
-    feedback.hidden = Boolean(items.length) && !failed;
+    const omitted = !server && session?.lastRequestDeclaredTools === false;
+    feedback.hidden = Boolean(items.length) && !failed && !omitted;
     if (failed) feedback.textContent = 'Не удалось обновить список. Повторяем запрос…';
     else if (!snapshot) feedback.textContent = 'Загружаем инструменты…';
+    else if (omitted) feedback.textContent = 'В последнем запросе список инструментов не передан.';
     else if (!items.length) feedback.textContent = server ? 'Серверных вызовов пока нет.' : session
       ? 'В последнем запросе агент не объявил инструментов.' : 'Агент пока не передавал инструменты по этому протоколу.';
   }

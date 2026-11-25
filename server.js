@@ -198,7 +198,10 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             payload = normalize(input, anthropic);
           const protocol = anthropic ? 'Anthropic' : 'OpenAI';
           const sessionId = (anthropic ? req.headers['x-deepseek-harness-session-id'] : undefined) ?? req.headers['x-session-id'];
-          const session = monitor.observe(protocol, (Array.isArray(input.tools) ? input.tools : []).map(t => (anthropic ? t : t?.function)?.name).filter(n => typeof n === 'string'), sessionId?.trim());
+          const declared = Array.isArray(input.tools)
+            ? input.tools.map(t => (anthropic ? t : t?.function)?.name).filter(name => typeof name === 'string')
+            : undefined;
+          const session = monitor.observe(protocol, declared, sessionId?.trim());
           const format = completion(res, anthropic, input.stream === true, input.stream_options?.include_usage === true);
           const abort = new AbortController();
           res.on('close', () => {
