@@ -30,6 +30,17 @@ impl Service {
     }
 }
 
+fn open_external(app: &AppHandle, target: &tauri::Url) {
+    if target.scheme() == "https" && matches!(target.host_str(), Some("code.1c.ai" | "ingvar.pro"))
+    {
+        if let Err(error) = app.opener().open_url(target.as_str(), None::<&str>) {
+            app.dialog()
+                .message(format!("Не удалось открыть браузер. {error}"))
+                .show(|_| {});
+        }
+    }
+}
+
 fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = app.path().resource_dir()?.join("runtime");
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
@@ -64,23 +75,21 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     }
     let origin = url.origin();
     let handle = app.clone();
+    let popup_handle = app.clone();
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
         .title("Напарник · Ingvar Consulting")
         .inner_size(440., 300.)
         .min_inner_size(350., 300.)
         .center()
-        .on_navigation(move |next| next.origin() == origin)
-        .on_new_window(move |target, _| {
-            if target.scheme() == "https"
-                && matches!(target.host_str(), Some("code.1c.ai" | "ingvar.pro"))
-            {
-                if let Err(error) = handle.opener().open_url(target.as_str(), None::<&str>) {
-                    handle
-                        .dialog()
-                        .message(format!("Не удалось открыть браузер. {error}"))
-                        .show(|_| {});
-                }
+        .on_navigation(move |next| {
+            if next.origin() == origin {
+                return true;
             }
+            open_external(&handle, next);
+            false
+        })
+        .on_new_window(move |target, _| {
+            open_external(&popup_handle, &target);
             NewWindowResponse::Deny
         })
         .build()?;
