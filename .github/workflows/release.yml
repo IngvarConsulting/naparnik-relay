@@ -1,0 +1,74 @@
+name: Desktop release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency: desktop-release
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, triple: aarch64-apple-darwin, platform: darwin-aarch64, arch: arm64, bundles: 'app,dmg'}
+          - {runner: macos-15, triple: x86_64-apple-darwin, platform: darwin-x86_64, arch: x64, bundles: 'app,dmg'}
+          - {runner: windows-2022, triple: x86_64-pc-windows-msvc, platform: windows-x86_64, arch: x64, bundles: nsis}
+          - {runner: ubuntu-22.04, triple: x86_64-unknown-linux-gnu, platform: linux-x86_64, arch: x64, bundles: appimage}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2 xauth xvfb
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.triple }}
+      - run: rustup override set stable
+      - run: npm ci
+      - run: npm test
+      - name: Build and sign update
+        run: npm run desktop:build -- --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }}
+        env:
+          RELAY_ARCH: ${{ matrix.arch }}
+          NO_STRIP: 'true'
+          CI: 'true'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+      - name: Collect installers
+        run: python scripts/release.py collect dist --target ${{ matrix.platform }} --bundle src-tauri/target/${{ matrix.triple }}/release/bundle
+      - name: Launch installed package
+        if: matrix.platform != 'darwin-x86_64'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a python scripts/smoke-desktop.py dist
+          else
+            python scripts/smoke-desktop.py dist
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          compression-level: 0
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: python scripts/release.py manifest dist
+      - name: Publish installers and update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(node -p 'require("./package.json").version')"
+          gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "Naparnik Relay ${tag}" --notes-file RELEASE.md

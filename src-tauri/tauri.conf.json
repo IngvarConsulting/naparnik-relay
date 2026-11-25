@@ -1,0 +1,66 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Naparnik Relay",
+  "version": "../package.json",
+  "identifier": "pro.ingvar.naparnik-relay",
+  "build": {
+    "frontendDist": "../public",
+    "beforeBuildCommand": "node scripts/prepare-runtime.js"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "appimage"
+    ],
+    "publisher": "Ingvar Consulting",
+    "category": "DeveloperTool",
+    "shortDescription": "Local gateway for 1C:Naparnik",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "runtime/": "runtime/"
+    },
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": true,
+        "languages": [
+          "Russian",
+          "English"
+        ]
+      }
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/IngvarConsulting/naparnik-relay/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJGREVCNjZEMTkwNUNFNEQKUldSTnpnVVpiYmJldjRRVVdaNDhWa3ZMYnVYbjRVRnJvZGg2QlloOGs2YjJqaE0zb0haYUlseUEK"
+    }
+  }
+}

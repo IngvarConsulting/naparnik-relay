@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f7f3" />
+    <title>Напарник · Локальный шлюз</title>
+    <link rel="icon" href="/icon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="wrap bar">
+        <div class="brand">
+          <img src="/naparnik.svg" width="48" height="28" alt="1С" /><b>Напарник</b><span>Локальный шлюз</span>
+        </div>
+        <a class="publisher" href="https://ingvar.pro/" target="_blank" rel="noreferrer"><img src="/ingvar-consulting.png" width="158" height="28" alt="Ingvar Consulting" /></a>
+      </div>
+    </header>
+    <main class="wrap">
+      <div class="title">
+        <h1>Подключение</h1>
+        <span class="live" id="local">Проверяем шлюз</span>
+      </div>
+      <section class="hero">
+        <div class="hero-body">
+          <div class="service"><i id="signal"></i> 1С:Напарник</div>
+          <h2 id="headline">Проверяем связь</h2>
+          <p id="subtitle">Загружаем состояние подключения.</p>
+          <div id="actions" hidden>
+            <button id="manage" class="light">Подключить аккаунт</button
+            ><button id="refresh" class="ghost" hidden>Обновить</button>
+          </div>
+        </div>
+        <div class="art"><canvas id="cable" width="960" height="420" aria-hidden="true"></canvas></div>
+      </section>
+      <div class="columns">
+        <section class="client">
+          <div class="sec-head"><h2>Настройка клиента</h2></div>
+          <div class="switch" aria-label="Клиент">
+            <button id="zcode" aria-pressed="true">ZCode</button
+            ><button id="dsh" aria-pressed="false">DeepSeek Harness</button>
+          </div>
+          <p class="instructions" id="guide"></p>
+          <dl id="fields">
+            <div>
+              <dt>Base URL</dt>
+              <dd>
+                <code id="url">—</code
+                ><button class="copy" data-copy="url" aria-label="Копировать Base URL" disabled></button>
+              </dd>
+            </div>
+            <div>
+              <dt>Model ID</dt>
+              <dd>
+                <code id="model">—</code
+                ><button class="copy" data-copy="model" aria-label="Копировать Model ID" disabled></button>
+              </dd>
+            </div>
+            <div>
+              <dt>API key</dt>
+              <dd>
+                <code class="masked" id="key">•••• •••• ••••</code
+                ><button
+                  class="copy"
+                  data-copy="key"
+                  aria-label="Копировать локальный API key"
+                  disabled
+                ></button>
+              </dd>
+            </div>
+          </dl>
+          <small id="tip"></small>
+        </section>
+        <section class="limits">
+          <div class="sec-head"><h2>Лимиты Напарника</h2></div>
+          <div class="meter">
+            <div><span>За 5 часов</span><strong id="hours-value">—</strong></div>
+            <progress id="hours" max="100" value="0" aria-label="Использовано за 5 часов"></progress
+            ><small id="hours-reset"></small>
+          </div>
+          <div class="meter">
+            <div><span>За неделю</span><strong id="week-value">—</strong></div>
+            <progress id="week" max="100" value="0" aria-label="Использовано за неделю"></progress
+            ><small id="week-reset"></small>
+          </div>
+          <p class="note" id="checked">Лимиты появятся после подключения аккаунта.</p>
+        </section>
+      </div>
+      <section class="activity">
+        <div class="sec-head">
+          <h2>Последние запросы</h2>
+          <span id="counter"></span>
+        </div>
+        <p class="empty" id="empty">Здесь появятся запросы клиентов к модели.</p>
+        <ul id="rows"></ul>
+      </section>
+    <footer><a class="doc" href="https://code.1c.ai/public-api/" target="_blank" rel="noreferrer">Документация API ↗</a></footer>
+    </main>
+    <dialog id="dialog" aria-labelledby="modal-title">
+      <form id="account">
+        <div class="modal-head">
+          <h2 id="modal-title">Подключить аккаунт</h2>
+          <button type="button" class="close" id="close" aria-label="Закрыть">×</button>
+        </div>
+        <p>
+          Откройте раздел «Ключи доступа» в
+          <a href="https://code.1c.ai/api/auth/login" target="_blank" rel="noreferrer"
+            >кабинете Напарника ↗</a
+          >
+          и скопируйте API-ключ.
+        </p>
+        <label for="secret">API-ключ Напарника</label
+        ><input
+          id="secret"
+          type="password"
+          placeholder="Вставьте ключ"
+          autocomplete="off"
+          spellcheck="false"
+          required
+        /><label class="remember"
+          ><input id="remember" type="checkbox" /> Запомнить ключ на этом компьютере</label
+        ><small>Без сохранения ключ действует до остановки шлюза.</small>
+        <p class="error" id="error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="submit" class="primary" id="connect">Проверить и подключить</button
+          ><button type="button" class="unlink" id="unlink" hidden>Отключить аккаунт</button>
+        </div>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status"></div>
+  </body>
+</html>

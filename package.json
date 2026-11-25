@@ -1,0 +1,19 @@
+{
+  "name": "naparnik-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node launch.js",
+    "test": "node --test",
+    "serve": "node server.js",
+    "stop": "node launch.js --stop",
+    "desktop:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.6"
+  }
+}
