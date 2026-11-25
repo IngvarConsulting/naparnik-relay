@@ -9,9 +9,12 @@ import { createServer } from '../server.js';
 
 test('Оба клиента, ключи, история, поток и ошибки', async (t) => {
   const received = [],
-    accounts = [];
+    accounts = [],
+    titleRequests = [];
   let id = 0,
-    breaking = false;
+    breaking = null,
+    missingContext = false,
+    toolArguments = '{ "x" : 1 }';
   const mock = http.createServer(async (req, res) => {
     assert.equal(req.headers.authorization, 'Bearer real-fixture');
     if (req.url === '/budget') {
@@ -26,18 +29,26 @@ test('Оба клиента, ключи, история, поток и ошиб�
     }
     if (req.url.includes('/context_tokens?branch=')) {
       assert.match(req.url, /branch=answer$/);
+      if (missingContext) {
+        res.statusCode = 503;
+        return res.end('{}');
+      }
       return res.end(JSON.stringify({token_count: 101, max_context_length: 384000}));
     }
     let raw = '';
     for await (const p of req) raw += p;
+    if (req.url.endsWith('/title')) {
+      titleRequests.push({ path: req.url, method: req.method, body: raw });
+      return res.end(JSON.stringify({ title: 'A generated title' }));
+    }
     const body = JSON.parse(raw);
     received.push({ body, url: req.url });
     res.setHeader('content-type', 'text/event-stream');
     const event = (obj) => res.write('data: ' + JSON.stringify(obj) + '\r\n\r\n');
     event({ uuid: 'echo', role: body.role, finished: true });
-    event({ uuid: 'answer', role: null, finished: false, content_delta: { content: 'Черновик' } });
+    event({ uuid: body.content === 'permission' ? 'permission-request' : 'answer', role: null, finished: false, content_delta: { content: 'Черновик' } });
     if (breaking) {
-      event({ error_type: 'budget_exceeded', error: 'limit' });
+      event({ error_type: breaking, error: 'fixture error' });
       res.end();
       return;
     }
@@ -50,7 +61,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
     }
     const content =
       body.content === 'tool'
-        ? { tool_calls: [{ id: 'call-1', function: { name: body.tools[0].name, arguments: '{"x":1}' } }] }
+        ? { tool_calls: [{ id: 'call-1', function: { name: body.tools[0].name, arguments: toolArguments } }] }
         : { content: 'Готово' };
     event({ uuid: 'answer', role: 'assistant', finished: true, content, usage: {prompt_tokens:90, cached_tokens:64, completion_tokens:10, total_tokens:100}, details:{max_context_length:384000} });
     res.end();
@@ -94,6 +105,19 @@ test('Оба клиента, ключи, история, поток и ошиб�
   );
   const oa = { Authorization: 'Bearer local-fixture' },
     an = { 'x-api-key': 'local-fixture' };
+  const claudeHeaders = { ...an, 'anthropic-version': '2023-06-01' };
+  const modelList = await (await request('/v1/models', undefined, claudeHeaders)).json();
+  assert.deepEqual([modelList.first_id, modelList.last_id, modelList.has_more], ['naparnik', 'naparnik', false]);
+  assert.equal(modelList.data[0].type, 'model');
+  assert.deepEqual(
+    await (await request('/v1/models/naparnik', undefined, claudeHeaders)).json(),
+    modelList.data[0]
+  );
+  const nextPage = await (await request('/v1/models?after_id=naparnik', undefined, claudeHeaders)).json();
+  assert.deepEqual(nextPage, { data: [], first_id: null, last_id: null, has_more: false });
+  const openAIModel = await (await request('/v1/models/naparnik', undefined, oa)).json();
+  assert.equal(openAIModel.object, 'model');
+  assert.equal(openAIModel.id, 'naparnik');
   const tools = [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }];
   const messages = [{ role: 'user', content: 'tool' }];
   const post = (path, body, headers) => request('/v1/' + path, { model: 'naparnik', ...body }, headers);
@@ -138,6 +162,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
           { role: 'assistant', content: a.content },
           { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: '42' }] }
         ],
+        system: 'Harness refreshed its system prompt during the tool call.',
         tools: aTools,
         stream: true
       },
@@ -168,12 +193,49 @@ test('Оба клиента, ключи, история, поток и ошиб�
   ]);
   const sessionHeaders = { ...oa, 'x-session-id': 'chat-A' };
   const chat = [{role: 'user', content: 'permission'}];
-  await Promise.all([
-    post('chat/completions', {messages: chat, tools}, sessionHeaders),
-    post('messages', {messages: chat, tools: aTools}, {...an, 'x-deepseek-harness-session-id': 'chat-A'}),
-    post('chat/completions', {messages: chat, tools}, {...oa, 'x-session-id': 'chat-B'})
-  ]);
-  assert.equal((await post('messages', {messages: [{role:'user', content:'title'}]}, {...an, 'x-deepseek-harness-session-id': 'chat-A'})).status, 200);
+  const harnessHeaders = {...an, 'x-deepseek-harness-session-id': 'chat-A'};
+  await post('chat/completions', {messages: chat, tools}, sessionHeaders);
+  await post('messages', {messages: chat, tools: aTools}, harnessHeaders);
+  const previousChat = received.at(-1);
+  await post('chat/completions', {messages: chat, tools}, {...oa, 'x-session-id': 'chat-B'});
+  const titleInput = {
+    system: 'Create a concise title for an AI coding-assistant session from the supplied human messages.\n' +
+      'Return only the title on one line, **in plain text of natural language**, with no quotes, prefix, explanation, Markdown, XML, or terminal control codes. No code is allowed.\n' +
+      'Use the language of the messages.\n' +
+      'Aim for about 5 words in non-CJK languages or 10 CJK characters.\n' +
+      'If the messages give little to name, still return a short best-effort title, such as Greeting, instead of explaining.',
+    messages: [{role: 'user', content: [{type: 'text',
+      text: 'Generate the session title from this JSON array of human messages:\n' +
+        JSON.stringify([{ seq: 5, text: 'permission' }])
+    }]}],
+    stream: true
+  };
+  const postsBeforeTitle = received.length;
+  const titleResponse = await post('messages', titleInput, harnessHeaders);
+  assert.equal(titleResponse.status, 200);
+  assert.match(await titleResponse.text(), /A generated title/);
+  assert.equal(received.length, postsBeforeTitle);
+  assert.equal(titleRequests.length, 1);
+  assert.deepEqual(titleRequests[0], {
+    path: previousChat.url.replace('/messages', '/title'), method: 'POST', body: ''
+  });
+  const updateResponse = await post('messages', {
+    ...titleInput,
+    messages: [{role: 'user', content: [{type: 'text',
+      text: 'Update the session title from this JSON object:\n' +
+        JSON.stringify({ currentTitle: 'A generated title', messages: [
+          { seq: 5, text: 'permission' }, { seq: 8, text: 'follow-up' }
+        ] })
+    }]}]
+  }, harnessHeaders);
+  assert.equal(updateResponse.status, 200);
+  assert.match(await updateResponse.text(), /A generated title/);
+  assert.equal(received.length, postsBeforeTitle);
+  assert.deepEqual(titleRequests[1], titleRequests[0]);
+  await post('messages', {messages: [{role: 'user', content: 'A normal question about titles'}]}, harnessHeaders);
+  assert.equal(received.at(-1).url, previousChat.url);
+  assert.equal(received.at(-1).body.parent_uuid, 'answer');
+  assert.equal(titleRequests.length, 2);
   assert.equal((await post('chat/completions', {messages: [{role:'user', content:'now empty'}], tools: []}, sessionHeaders)).status, 200);
   const grouped = await (await request('/panel/tools', undefined, header)).json();
   assert.equal(grouped.sessions.length, 5);
@@ -186,12 +248,41 @@ test('Оба клиента, ключи, история, поток и ошиб�
     assert.deepEqual(session.history.map(h => [h.protocol, h.name]), [[session.protocol, 'mcp__web__fetch']]);
   }
   assert.deepEqual(grouped.history, log.history);
-  breaking = true;
+  missingContext = true;
+  const unmeasured = await (await post('chat/completions', { messages, tools }, zcode)).json();
+  assert.equal(unmeasured.usage.total_tokens, 100);
+  assert.equal(unmeasured.naparnik_context, undefined);
+  missingContext = false;
+  breaking = 'budget_exceeded';
   const bad = await post('messages', { messages }, an);
   assert.equal(bad.status, 402);
-  assert.match(await bad.text(), /Лимит/);
+  const billing = await bad.json();
+  assert.equal(billing.error.type, 'billing_error');
+  assert.match(billing.error.message, /Лимит/);
+  const quota = await post('chat/completions', { messages }, oa);
+  assert.equal(quota.status, 429);
+  assert.equal((await quota.json()).error.code, 'insufficient_quota');
+  breaking = 'validation';
+  const invalid = await post('messages', { messages }, an);
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).error.type, 'invalid_request_error');
+  breaking = 'conflict';
+  const conflict = await post('messages', { messages }, an);
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).error.type, 'conflict_error');
   const image = await post('messages', { messages: [{ role: 'user', content: [{ type: 'image' }] }] }, an);
   assert.equal(image.status, 400);
+  breaking = null;
+  const count = await post('messages/count_tokens', { messages }, an);
+  assert.equal(count.status, 404);
+  assert.equal((await count.json()).error.type, 'not_found_error');
+  const malformedSession = { ...an, 'x-session-id': 'malformed-anthropic' };
+  toolArguments = '[]';
+  const malformed = await post('messages', { messages, tools: aTools }, malformedSession);
+  assert.equal(malformed.status, 502);
+  toolArguments = '{ "x" : 1 }';
+  assert.equal((await post('messages', { messages, tools: aTools }, malformedSession)).status, 200);
+  assert.equal(received.at(-1).body.parent_uuid, null);
   const disconnected = await (await request('/panel/account', undefined, header, 'DELETE')).json();
   assert.equal(disconnected.configured, false);
   assert.equal((await post('messages', { messages }, an)).status, 503);

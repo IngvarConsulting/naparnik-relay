@@ -13,6 +13,8 @@ function blocks(part) {
     } catch {
       throw new Fault(502, 'bad_tool_input', 'Напарник вернул неполные аргументы инструмента.');
     }
+    if (!input || typeof input !== 'object' || Array.isArray(input))
+      throw new Fault(502, 'bad_tool_input', 'Напарник вернул аргументы инструмента в неподдерживаемом формате.');
     result.push({ type: 'tool_use', id: c.id, name: c.name, input });
   }
   return result;
@@ -42,7 +44,7 @@ export function completion(res, anthropic, stream, includeUsage) {
       ...base,
       created,
       object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta, finish_reason }],
+      choices: [{ index: 0, delta, logprobs: null, finish_reason }],
       ...(includeUsage ? { usage: null } : {}),
       ...(finish_reason ? contextField() : {})
     });
@@ -73,10 +75,11 @@ export function completion(res, anthropic, stream, includeUsage) {
     metrics(providerUsage, branchContext) { usage = providerUsage; context = branchContext; },
     waiting() { if (stream) start(); },
     part(part) {
+      const contentBlocks = anthropic ? blocks(part) : undefined;
       if (!stream) return;
       start();
       if (anthropic) {
-        for (const block of blocks(part)) {
+        for (const block of contentBlocks) {
           const content_block = block.type === 'text' ? { type: 'text', text: '' } : { ...block, input: {} };
           frame({ type: 'content_block_start', index, content_block });
           const delta =
@@ -126,6 +129,7 @@ export function completion(res, anthropic, stream, includeUsage) {
               {
                 index: 0,
                 finish_reason: reason,
+                logprobs: null,
                 message: {
                   role: 'assistant',
                   content: reply.content || (tools ? null : ''),

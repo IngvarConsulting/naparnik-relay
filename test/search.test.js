@@ -10,7 +10,10 @@ const answer = (uuid, content, tool_calls) => ({
   uuid,
   content: { content, tool_calls }
 });
+const delta = (uuid, content_delta) => ({ uuid, parent_uuid: null, role: null, finished: false, content: null, content_delta });
 const accepted = (id) => ({ tool_call_id: id, status: 'accepted', content: null });
+const result = (uuid, parent_uuid, id) => ({ uuid, parent_uuid, role: 'tool', finished: true, content: accepted(id), content_delta: null });
+const event = (packet) => 'data: ' + JSON.stringify(packet) + '\n\n';
 const query = { messages: [{ role: 'user', content: 'Проверь по ИТС' }], tools: [] };
 function service(rounds) {
   const bridge = new Bridge();
@@ -21,7 +24,7 @@ function service(rounds) {
     posts.push(body);
     const events = rounds.shift();
     assert.ok(events, 'unexpected additional request');
-    return new Response(events.map((p) => 'data: ' + JSON.stringify(p) + '\n\n').join(''));
+    return new Response(typeof events === 'string' ? events : events.map(event).join(''));
   };
   return { bridge, posts };
 }
@@ -47,7 +50,7 @@ test('Поиск ИТС: групповые и повторные запросы
 
 test('Совместный запрос клиентского инструмента и поиска подтверждается одной группой', async () => {
   const { bridge, posts } = service([
-    [answer('a', '', [call('s'), call('c', 'client_lookup')])],
+    [answer('a', '', [call('s'), call('c', 'client_lookup')]), answer('b', 'Жду результат.', [])],
     [answer('done', 'Готово', [])]
   ]);
   const tools = [{ name: 'lookup', description: '', parameters: { type: 'object' } }];
@@ -58,13 +61,77 @@ test('Совместный запрос клиентского инструме�
     tools,
     messages: [...query.messages, reply, { role: 'tool', id: 'c', content: '42', status: 'ok' }]
   });
+  assert.equal(posts[1].parent_uuid, 'a');
   assert.deepEqual(posts[1].content, [{ tool_call_id: 'c', content: '42', status: 'ok' }, accepted('s')]);
 });
 
 test('Готовый результат в том же потоке не требует повторного подтверждения', async () => {
-  const { bridge, posts } = service([[answer('a', '', [call('s')]), answer('b', 'Нашёл.', [])]]);
-  assert.equal((await run(bridge)).content, 'Нашёл.');
+  const { bridge, posts } = service([[
+    answer('a', '', [call('s')]),
+    delta('', { tool_call_id: 's', name: search }),
+    answer('b', 'Ищу.', []),
+    result('tool-s', 'a', 's'),
+    answer('c', 'Нашёл.', [])
+  ]]);
+  assert.equal((await run(bridge)).content, 'Ищу.\n\nНашёл.');
   assert.equal(posts.length, 1);
+});
+
+test('Подтверждение поиска следует UUID вызова после другого финала ассистента', async () => {
+  const { bridge, posts } = service([
+    [answer('a', '', [call('s')]), answer('b', '', [])],
+    [result('tool-s', 'a', 's'), answer('c', 'Нашёл.', [])]
+  ]);
+  assert.equal((await run(bridge)).content, 'Нашёл.');
+  assert.deepEqual(posts[1], { role: 'tool', parent_uuid: 'a', no_generate: false, content: [accepted('s')] });
+});
+
+test('Дельта второго ответа без финала оставляет курсор на предыдущем ходе', async () => {
+  const { bridge, posts } = service([
+    [answer('previous', 'Готово.', [])],
+    [answer('first', 'Первая часть.', []), delta('second', { content: 'Незавершённая часть.' })],
+    [answer('retry', 'Повтор завершён.', [])]
+  ]);
+  const previous = await run(bridge);
+  const next = { ...query, messages: [...query.messages, previous, { role: 'user', content: 'Продолжай' }] };
+  await assert.rejects(run(bridge, next), { code: 'incomplete_stream' });
+  assert.equal((await run(bridge, next)).content, 'Повтор завершён.');
+  assert.deepEqual(posts.slice(1).map((post) => post.parent_uuid), ['previous', 'previous']);
+});
+
+test('Финал без завершающей пустой строки считается оборванным SSE-событием', async () => {
+  const partial = event(answer('first', 'Первая часть.', [])) + event(answer('second', 'Вторая часть.', [])).slice(0, -1);
+  const { bridge } = service([partial]);
+  await assert.rejects(run(bridge), { code: 'incomplete_stream' });
+});
+
+test('Обрыв потока во время работы серверного инструмента сохраняет прежний курсор', async () => {
+  const { bridge, posts } = service([
+    [answer('prior', 'Earlier answer', [])],
+    [
+      answer('requested', '', [call('s')]),
+      { uuid: '', finished: false, content: null, content_delta: { tool_call_id: 's', name: search } }
+    ],
+    [answer('retry', 'Retry answer', [])]
+  ]);
+  await run(bridge);
+  await assert.rejects(run(bridge), { status: 502, code: 'incomplete_stream' });
+  assert.equal(posts.length, 2);
+  await run(bridge);
+  assert.equal(posts[2].parent_uuid, 'prior');
+});
+
+test('Ошибка передачи SSE возвращается как незавершённый ответ', async () => {
+  const bridge = new Bridge();
+  bridge.request = async (_key, path) => {
+    if (path === '/conversations') return Response.json({ uuid: 'chat' });
+    const stream = new ReadableStream({
+      pull(controller) { controller.error(new TypeError('Connection reset')); }
+    });
+    return new Response(stream);
+  };
+  await assert.rejects(run(bridge), { status: 502, code: 'incomplete_stream' });
+  assert.equal(bridge.sessions.size, 0);
 });
 
 test('Отмена и повтор идентификатора прерывают поиск', async () => {

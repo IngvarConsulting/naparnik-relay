@@ -18,7 +18,7 @@ const assets = new Map([
   ['/naparnik.svg', ['naparnik.svg', 'image/svg+xml']],
   ['/ingvar-consulting.png', ['ingvar-consulting.png', 'image/png']]
 ]);
-async function body(req) {
+async function body(req, allowEmpty = false) {
   let size = 0;
   const parts = [];
   for await (const part of req) {
@@ -26,16 +26,24 @@ async function body(req) {
     if (size > 16 * 1024 * 1024) throw new Fault(413, 'request_too_large', 'Запрос превышает 16 МБ.');
     parts.push(part);
   }
+  if (allowEmpty && size === 0) return {};
   try {
     return JSON.parse(Buffer.concat(parts).toString());
   } catch {
     throw new Fault(400, 'invalid_json', 'Ожидается JSON.');
   }
 }
+const anthropicErrorTypes = new Map([
+  [400, 'invalid_request_error'], [401, 'authentication_error'], [402, 'billing_error'],
+  [403, 'permission_error'], [404, 'not_found_error'], [409, 'conflict_error'],
+  [413, 'request_too_large'], [429, 'rate_limit_error'], [529, 'overloaded_error']
+]);
+
 export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor(), profileDir = dir } = {}) {
   const sessionTitles = new SessionTitles();
+  const conversationQueue = new Map();
   function newBridge(key) {
-    return new Bridge(upstream, key ? new SessionBindings(profileDir, key) : undefined);
+    return new Bridge(upstream, key ? new SessionBindings(profileDir, key) : undefined, conversationQueue);
   }
   let key = connection.upstream,
     bridge = newBridge(key),
@@ -101,7 +109,11 @@ export function createServer({ connection = load(), upstream, persist = save, mo
   const server = http.createServer(async (req, res) => {
     const path = req.url?.split('?')[0],
       method = req.method;
-    const anthropic = path === '/v1/messages';
+    const nativeCompact = method === 'POST' &&
+      path?.match(/^\/v1\/conversations\/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\/compact$/);
+    const models = path === '/v1/models' || path?.startsWith('/v1/models/');
+    const anthropic = path === '/v1/messages' || path === '/v1/messages/count_tokens' ||
+      (models && typeof req.headers['anthropic-version'] === 'string');
     const send = (data, status = 200) => {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
@@ -184,20 +196,46 @@ export function createServer({ connection = load(), upstream, persist = save, mo
         }
       }
       if (path.startsWith('/v1/')) {
-        if (
-          !(
-            req.headers.authorization === 'Bearer ' + connection.localKey ||
-            req.headers['x-api-key'] === connection.localKey
-          )
-        )
+        const { localKey } = connection;
+        if (typeof localKey !== 'string' || !localKey ||
+            (req.headers.authorization !== 'Bearer ' + localKey && req.headers['x-api-key'] !== localKey))
           throw new Fault(401, 'authentication_error', 'Скопируйте локальный API key из панели.');
-        if (path === '/v1/models' && method === 'GET')
-          return send({
-            object: 'list',
-            data: [{ id: MODEL, object: 'model', created: 0, owned_by: 'naparnik-relay',
-              ...(bridge.contextWindow ? { context_length: bridge.contextWindow } : {}) }]
+        if (nativeCompact) {
+          const credential = key, activeBridge = bridge;
+          if (!credential) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
+          const abort = new AbortController();
+          const signal = AbortSignal.any([abort.signal, accountLifetime.signal]);
+          res.once('close', () => {
+            if (!res.writableEnded) abort.abort();
           });
-        if ((anthropic || path === '/v1/chat/completions') && method === 'POST') {
+          const input = await body(req, true);
+          requireInput(input && typeof input === 'object' && !Array.isArray(input) &&
+            Object.keys(input).every(name => name === 'instruction') &&
+            (input.instruction === undefined || typeof input.instruction === 'string'),
+          'Ожидается объект с необязательной строкой instruction.');
+          const result = await activeBridge.compact(credential, nativeCompact[1].toLowerCase(), input, signal);
+          if (!res.destroyed) send(result);
+          return;
+        }
+        if (models && method === 'GET') {
+          const context = bridge.contextWindow ? { context_length: bridge.contextWindow } : {};
+          const model = anthropic
+            ? { id: MODEL, type: 'model', created_at: '1970-01-01T00:00:00Z', display_name: '1С:Напарник', ...context }
+            : { id: MODEL, object: 'model', created: 0, owned_by: 'naparnik-relay', ...context };
+          if (path === '/v1/models/' + MODEL) return send(model);
+          if (path !== '/v1/models') throw new Fault(404, 'model_not_found', 'Модель не найдена.');
+          if (!anthropic) return send({ object: 'list', data: [model] });
+
+          const query = new URLSearchParams(req.url.slice(path.length));
+          const before = query.get('before_id');
+          const after = query.get('after_id');
+          requireInput((before === null || after === null) &&
+            (before ?? after ?? MODEL) === MODEL, 'Укажите корректный курсор списка моделей.');
+          const empty = before !== null || after !== null;
+          const cursor = empty ? null : MODEL;
+          return send({ data: empty ? [] : [model], first_id: cursor, last_id: cursor, has_more: false });
+        }
+        if ((path === '/v1/messages' || path === '/v1/chat/completions') && method === 'POST') {
           if (!key) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
           const harnessId = anthropic && req.headers['x-deepseek-harness-session-id']?.trim();
           const input = await body(req),
@@ -220,7 +258,10 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           let outcome = 'Готово';
           try {
             const signal = AbortSignal.any([abort.signal, accountLifetime.signal]);
-            const answer = await bridge.generate(key, { ...payload, protocol, sessionId }, signal, format.part, (name) => {
+            const answer = await bridge.generate(key, {
+              ...payload, protocol, sessionId,
+              onConversation: id => res.setHeader('X-Relay-Conversation-Id', id)
+            }, signal, format.part, (name) => {
               format.waiting();
               monitor.serverCall(protocol, name, session);
             }, format.metrics);
@@ -249,24 +290,27 @@ export function createServer({ connection = load(), upstream, persist = save, mo
       throw new Fault(404, 'not_found', 'Маршрут не найден.');
     } catch (e) {
       if (res.destroyed || res.writableEnded) return;
-      const status = e.status || 500,
-        code = e.code || 'internal_error';
+      const upstreamStatus = e.status || 500;
+      const clientAPI = !nativeCompact && path?.startsWith('/v1/');
+      const openAIQuota = clientAPI && !anthropic && upstreamStatus === 402;
+      const status = openAIQuota ? 429 : clientAPI && upstreamStatus === 422 ? 400 : upstreamStatus;
+      const code = openAIQuota ? 'insufficient_quota' : e.code || 'internal_error';
       const msg = e instanceof Fault ? e.message : 'Не удалось обработать запрос.';
-      const error = anthropic
-        ? {
-            type: 'error',
-            error: {
-              type:
-                {
-                  400: 'invalid_request_error',
-                  401: 'authentication_error',
-                  403: 'permission_error',
-                  429: 'rate_limit_error'
-                }[status] || 'api_error',
-              message: msg
-            }
-          }
-        : { error: { message: msg, type: code, code } };
+      let error;
+      if (nativeCompact) {
+        error = { error: msg, error_type: code };
+      } else if (anthropic) {
+        error = { type: 'error', error: { type: anthropicErrorTypes.get(status) ?? 'api_error', message: msg } };
+      } else if (clientAPI) {
+        const type = openAIQuota ? 'insufficient_quota' :
+          status >= 500 ? 'server_error' :
+          status === 429 ? 'rate_limit_error' :
+          status === 401 ? 'authentication_error' :
+          status === 403 ? 'permission_error' : 'invalid_request_error';
+        error = { error: { message: msg, type, param: null, code } };
+      } else {
+        error = { error: { message: msg, type: code, code } };
+      }
       if (res.headersSent) {
         res.end((anthropic ? 'event: error\n' : '') + 'data: ' + JSON.stringify(error) + '\n\n');
       } else send(error, status);

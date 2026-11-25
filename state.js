@@ -25,6 +25,15 @@ export function save(value, create = false) {
   writePrivateJSON(file, value, create);
 }
 
+function isCursor(value) {
+  return typeof value?.conversation === 'string' && value.conversation &&
+    typeof value.parent === 'string' && value.parent &&
+    Array.isArray(value.clientNames) && value.clientNames.every(name => typeof name === 'string') &&
+    Array.isArray(value.serverDecisions) && value.serverDecisions.every(
+      item => typeof item?.tool_call_id === 'string' && item.status === 'accepted' && item.content === null
+    );
+}
+
 export class SessionBindings {
   constructor(profileDir, key) {
     this.directory = join(profileDir, 'sessions');
@@ -40,12 +49,11 @@ export class SessionBindings {
   get(id) {
     try {
       const state = JSON.parse(readFileSync(this.path(id), 'utf8'));
-      if (typeof state.conversation !== 'string' || !state.conversation ||
-          typeof state.parent !== 'string' || !state.parent ||
-          !Array.isArray(state.clientNames) || !state.clientNames.every(name => typeof name === 'string') ||
-          !Array.isArray(state.serverDecisions) || !state.serverDecisions.every(
-            item => typeof item?.tool_call_id === 'string' && item.status === 'accepted' && item.content === null
-          )) throw new Error('Повреждена сохранённая привязка диалога.');
+      if (!isCursor(state) ||
+          (state.checkpoints !== undefined && (!Array.isArray(state.checkpoints) || !state.checkpoints.every(
+            checkpoint => isCursor(checkpoint) && typeof checkpoint.fingerprint === 'string' &&
+              /^[0-9a-f]{64}$/.test(checkpoint.fingerprint)
+          )))) throw new Error('Повреждена сохранённая привязка диалога.');
       return state;
     } catch (error) {
       if (error.code === 'ENOENT') return undefined;
@@ -53,9 +61,9 @@ export class SessionBindings {
     }
   }
 
-  set(id, { conversation, parent, clientNames, serverDecisions }) {
+  set(id, { conversation, parent, clientNames, serverDecisions, checkpoints }) {
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    writePrivateJSON(this.path(id), { conversation, parent, clientNames: [...clientNames], serverDecisions });
+    writePrivateJSON(this.path(id), { conversation, parent, clientNames: [...clientNames], serverDecisions, checkpoints });
   }
 }
 
