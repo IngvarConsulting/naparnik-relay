@@ -8,7 +8,7 @@ const harnessId = new RegExp('^session-' + uuid + '$', 'i');
 
 export class SessionTitles {
   constructor(zcodeRoot = join(process.env.ZCODE_DATA_BASE_DIR || homedir(), '.zcode'), harnessRoot = process.env.DSH_HOME || join(homedir(), '.dsh')) {
-    this.database = join(zcodeRoot, 'cli', 'db', 'db.sqlite');
+    this.zcodeRoot = zcodeRoot;
     this.projections = join(harnessRoot, 'storages', 'session_projcache', 'sessions');
     this.cache = new Map();
   }
@@ -30,13 +30,19 @@ export class SessionTitles {
   async snapshot(records) {
     const sessions = records.sessions.map(session => ({ ...session }));
     const zcode = sessions.filter(s => s.protocol === 'OpenAI' && zcodeId.test(s.id));
-    if (zcode.length) {
+    // Desktop task titles include manual renames. CLI-only chats live in the session DB.
+    for (const [file, sql] of [
+      ['v2/tasks-index.sqlite', 'SELECT title FROM tasks WHERE task_id = ? AND deleted = 0 ORDER BY updated_at DESC LIMIT 1'],
+      ['cli/db/db.sqlite', 'SELECT title FROM session WHERE id = ?']
+    ]) {
+      const unresolved = zcode.filter(s => !s.title);
+      if (!unresolved.length) break;
       let db;
       try {
         const { DatabaseSync } = await import('node:sqlite');
-        db = new DatabaseSync(this.database, { readOnly: true });
-        const query = db.prepare('SELECT title FROM session WHERE id = ?');
-        for (const s of zcode) {
+        db = new DatabaseSync(join(this.zcodeRoot, file), { readOnly: true });
+        const query = db.prepare(sql);
+        for (const s of unresolved) {
           const row = query.get(s.id.startsWith('sess_') ? s.id : 'sess_' + s.id);
           if (row) Object.assign(s, { agent: 'ZCode', title: row.title });
         }
