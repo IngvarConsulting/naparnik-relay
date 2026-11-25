@@ -4,11 +4,14 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Bridge, Fault, MODEL, normalize, requireInput } from './bridge.js';
 import { completion } from './formats.js';
-import { load, save, port, origin } from './state.js';
+import { join } from 'node:path';
+import { ToolMonitor } from './tool-monitor.js';
+import { load, save, port, origin, dir } from './state.js';
 
 const assets = new Map([
   ['/', ['index.html', 'text/html']],
   ['/app.js', ['app.js', 'text/javascript']],
+  ['/tools.js', ['tools.js', 'text/javascript']],
   ['/style.css', ['style.css', 'text/css']],
   ['/icon.svg', ['icon.svg', 'image/svg+xml']],
   ['/naparnik.svg', ['naparnik.svg', 'image/svg+xml']],
@@ -28,11 +31,12 @@ async function body(req) {
     throw new Fault(400, 'invalid_json', 'Ожидается JSON.');
   }
 }
-export function createServer({ connection = load(), upstream, persist = save } = {}) {
+export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor() } = {}) {
   let bridge = new Bridge(upstream),
     key = connection.upstream,
     busy = false,
-    revision = 0;
+    revision = 0,
+    accountLifetime = new AbortController();
   let limits = null,
     checked = null,
     problem = null,
@@ -46,6 +50,8 @@ export function createServer({ connection = load(), upstream, persist = save } =
   });
   function reset() {
     revision++;
+    accountLifetime.abort();
+    accountLifetime = new AbortController();
     bridge = new Bridge(upstream);
     limits = checked = problem = refresh = null;
     recent = [];
@@ -134,6 +140,7 @@ export function createServer({ connection = load(), upstream, persist = save } =
           server.close();
           return;
         }
+        if (path === '/panel/tools' && method === 'GET') return send(monitor.records);
         if (path === '/panel/state' && method === 'GET') return send(status());
         if (path === '/panel/refresh' && method === 'POST') {
           await check();
@@ -188,6 +195,8 @@ export function createServer({ connection = load(), upstream, persist = save } =
           if (!key) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
           const input = await body(req),
             payload = normalize(input, anthropic);
+          const protocol = anthropic ? 'Anthropic' : 'OpenAI';
+          monitor.observe(protocol, (Array.isArray(input.tools) ? input.tools : []).map(t => (anthropic ? t : t?.function)?.name).filter(n => typeof n === 'string'));
           const format = completion(res, anthropic, input.stream === true, payload.messages);
           const abort = new AbortController();
           res.on('close', () => {
@@ -197,7 +206,11 @@ export function createServer({ connection = load(), upstream, persist = save } =
             generation = revision;
           let outcome = 'Готово';
           try {
-            const answer = await bridge.generate(key, payload, abort.signal, format.part);
+            const signal = AbortSignal.any([abort.signal, accountLifetime.signal]);
+            const answer = await bridge.generate(key, payload, signal, format.part, (name) => {
+              format.waiting();
+              monitor.serverCall(protocol, name);
+            });
             format.finish(answer);
           } catch (e) {
             outcome = abort.signal.aborted ? 'Отменён' : e.message;
@@ -249,7 +262,7 @@ export function createServer({ connection = load(), upstream, persist = save } =
   return server;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  createServer()
+  createServer({ monitor: new ToolMonitor(join(dir, 'tools.json')) })
     .on('error', (e) => {
       console.error('Ошибка запуска:', e.message);
       process.exitCode = 1;

@@ -34,6 +34,13 @@ test('Оба клиента, ключи, история, поток и ошиб�
       res.end();
       return;
     }
+    if (body.content === 'permission') {
+      event({uuid:'permission-request', role:'assistant', finished:true, content:{tool_calls:[
+        {id:'web', function:{name:'mcp__web__fetch', arguments:'{"url":"https://example.org"}'}}
+      ]}});
+      res.end();
+      return;
+    }
     const content =
       body.content === 'tool'
         ? { tool_calls: [{ id: 'call-1', function: { name: body.tools[0].name, arguments: '{"x":1}' } }] }
@@ -124,6 +131,19 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.match(s, /text_delta/);
   assert.equal(received.at(-1).body.role, 'tool');
   assert.equal(received.at(-1).url, received.at(-2).url);
+  const inventory = await (await request('/panel/tools', undefined, header)).json();
+  assert.deepEqual(inventory.clients, {OpenAI:['lookup'], Anthropic:['lookup']});
+  assert.equal((await request('/panel/tools', undefined, oa)).status, 403);
+  for (const [path, headers] of [['messages', an], ['chat/completions', oa]]) {
+    const final = post(path, {messages:[{role:'user', content:'permission'}], stream:true}, headers);
+    assert.match(await (await final).text(), /Готово/);
+    assert.equal(received.at(-1).body.parent_uuid, 'permission-request');
+    assert.deepEqual(received.at(-1).body.content, [{tool_call_id:'web', status:'accepted', content:null}]);
+  }
+  const log = await (await request('/panel/tools', undefined, header)).json();
+  assert.deepEqual(log.history.map(row => [row.protocol, row.name]), [
+    ['OpenAI','mcp__web__fetch'], ['Anthropic','mcp__web__fetch']
+  ]);
   breaking = true;
   const bad = await post('messages', { messages }, an);
   assert.equal(bad.status, 402);

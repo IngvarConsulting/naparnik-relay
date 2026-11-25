@@ -25,8 +25,8 @@ function service(rounds) {
   };
   return { bridge, posts };
 }
-const run = (bridge, body = query, controller = new AbortController(), part = () => {}) =>
-  bridge.generate('fixture', body, controller.signal, part);
+const run = (bridge, body = query, controller = new AbortController(), part = () => {}, onServerCall) =>
+  bridge.generate('fixture', body, controller.signal, part, onServerCall);
 
 test('Поиск ИТС: групповые и повторные запросы остаются в одном диалоге', async () => {
   const { bridge, posts } = service([
@@ -77,6 +77,37 @@ test('Отмена и повтор идентификатора прерываю
   assert.equal(posts.length, 1);
   const repeated = service([[answer('a', '', [call('s')])], [answer('b', '', [call('s')])]]);
   await assert.rejects(run(repeated.bridge), { code: 'repeated_tool_call' });
-  const unknown = service([[answer('a', '', [call('x', 'other_tool')])]]);
-  await assert.rejects(run(unknown.bridge), { code: 'unsupported_server_tool' });
+});
+
+test('Серверные инструменты подтверждаются автоматически, клиентский mcp__ остаётся у агента', async () => {
+  const name = 'mcp__web__fetch';
+  const {bridge, posts} = service([
+    [answer('a', '', [call('x', name), call('y'), call('client', 'client_' + name)])],
+    [answer('b', 'Завершено', [])]
+  ]);
+  const tools = [{name, parameters:{type:'object'}}];
+  const seen = [];
+  const reply = await run(bridge, {...query, tools}, new AbortController(), () => {}, (name) => seen.push(name));
+  assert.deepEqual(seen, [name, search]);
+  assert.deepEqual(reply.calls, [{id:'client', name, args:'{}'}]);
+  await run(bridge, { tools, messages:[...query.messages, reply, {role:'tool', id:'client', content:'result', status:'ok'}] });
+  assert.deepEqual(posts[1].content, [
+    { tool_call_id:'client', content:'result', status:'ok' },
+    accepted('x'),
+    accepted('y')
+  ]);
+});
+
+test('Серверное имя с client_ разрешается, ранее объявленный клиентский вызов не подтверждается', async () => {
+  const mock = service([
+    [answer('a', '', [call('s', 'client_remote')])],
+    [answer('b', 'Готово', [])],
+    [answer('c', '', [call('c', 'client_lookup')])]
+  ]);
+  const tools = [{name:'lookup', parameters:{type:'object'}}];
+  const reply = await run(mock.bridge, {...query, tools});
+  assert.deepEqual(mock.posts[1].content, [accepted('s')]);
+  await assert.rejects(run(mock.bridge, {messages:[...query.messages, reply, {role:'user', content:'Ещё'}], tools:[]}),
+    {code:'unknown_client_tool'});
+  assert.equal(mock.posts.length, 3);
 });

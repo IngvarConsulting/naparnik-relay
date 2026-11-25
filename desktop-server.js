@@ -1,5 +1,6 @@
 // Private startup channel between the native window and its child process.
 import { readFileSync } from 'node:fs';
+import { ToolMonitor } from './tool-monitor.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -22,10 +23,11 @@ if (!process.env.RELAY_PORT && !process.env.RELAY_DATA_DIR) {
 }
 
 const { createServer } = await import('./server.js');
-const { load, origin, port } = await import('./state.js');
+const { load, origin, port, dir } = await import('./state.js');
 
 const connection = load();
-const server = createServer({connection});
+const monitor = new ToolMonitor(join(dir, 'tools.json'));
+const server = createServer({connection, monitor});
 server.once('error', error => {
   const message = error.code === 'EADDRINUSE'
     ? 'Порт ' + port + ' уже занят. Если запущена браузерная версия шлюза, остановите её командой npm stop и снова откройте приложение.'

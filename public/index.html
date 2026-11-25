@@ -36,6 +36,7 @@
       </div>
       <footer>
         <a href="https://ingvar.pro/?utm_source=naparnik_relay&amp;utm_medium=app&amp;utm_campaign=about" rel="noreferrer"><img src="/ingvar-consulting.png" width="111" height="20" alt="Ingvar Consulting" /></a>
+        <a class="quiet tools-link" href="#tools">Инструменты</a>
         <details id="quota">
           <summary aria-label="Лимиты Напарника">
             <svg viewBox="0 0 32 32" width="27" height="27" fill="none" aria-hidden="true">
@@ -75,6 +76,16 @@
           <label class="remember"><input id="remember" type="checkbox" checked>Запомнить на этом компьютере</label>
         </div>
       </form>
+    </main>
+    <main id="tools" hidden aria-labelledby="tools-title">
+      <header class="auth-heading"><a href="#home" class="back-link" aria-label="Назад">←</a><h1 id="tools-title" tabindex="-1">Инструменты</h1></header>
+      <select id="tool-source" aria-label="Список инструментов">
+        <option value="server">Напарник · серверные вызовы</option>
+        <option value="OpenAI">Клиент · OpenAI Chat Completions</option>
+        <option value="Anthropic">Клиент · Anthropic Messages</option>
+      </select>
+      <ul id="tool-list"></ul>
+      <nav class="tool-pager" aria-label="Страницы списка"><button id="list-prev" aria-label="Предыдущая страница">‹</button><span id="list-page"></span><button id="list-next" aria-label="Следующая страница">›</button></nav>
     </main>
     <div class="toast" id="toast" role="status"></div>
   </body>

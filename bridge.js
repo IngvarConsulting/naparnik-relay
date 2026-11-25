@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 
 export const MODEL = 'naparnik';
-const ITS_SEARCH = 'mcp__knowledge-hub__Search_ITS';
 export class Fault extends Error {
   constructor(status, code, message) {
     super(message);
@@ -196,7 +195,7 @@ export class Bridge {
       throw new Fault(502, 'bad_budget', 'Напарник вернул неизвестный формат лимитов.');
     return limits;
   }
-  async generate(key, { messages, tools }, signal, onPart) {
+  async generate(key, { messages, tools }, signal, onPart, onServerCall = () => {}) {
     // The provider reserves tool names (including ZCode's TodoWrite). Give
     // client tools their own wire names and restore them in public responses.
     signal = AbortSignal.any([signal, AbortSignal.timeout(600000)]);
@@ -213,6 +212,7 @@ export class Bridge {
     let split = messages.length;
     while (split && messages[split - 1].role !== 'assistant') split--;
     const previous = split && this.history.get(fingerprint(messages.slice(0, split)));
+    const knownClientNames = new Set([...(previous?.clientNames ?? []), ...wireNames.keys()]);
     const tail = previous ? messages.slice(split) : messages;
     let conversation = previous?.conversation,
       parent = previous?.parent ?? null;
@@ -241,11 +241,11 @@ export class Bridge {
         else turns.push({ role: 'user', content: chunk });
       }
     }
-    if (previous?.pendingSearch?.length && turns[0]?.role === 'tool') {
-      turns[0].content.push(...previous.pendingSearch);
+    if (previous?.serverDecisions?.length && turns[0]?.role === 'tool') {
+      turns[0].content.push(...previous.serverDecisions);
     }
-    const accepted = new Set((previous?.pendingSearch ?? []).map((item) => item.tool_call_id));
-    let pendingSearch = [];
+    const reviewed = new Set((previous?.serverDecisions ?? []).map((item) => item.tool_call_id));
+    let serverDecisions = [];
     let text = '',
       calls = [];
     for (const [i, turn] of turns.entries()) {
@@ -279,7 +279,11 @@ export class Bridge {
         // A later assistant message in the same stream supersedes the earlier tool request.
         serverCalls.clear();
         for (const call of part.calls) {
-          if (!wireNames.has(call.name)) serverCalls.set(call.id, call);
+          if (wireNames.has(call.name)) continue;
+          if (knownClientNames.has(call.name))
+            throw new Fault(502, 'unknown_client_tool', 'Напарник запросил клиентский инструмент вне текущего списка.');
+          serverCalls.set(call.id, call);
+          onServerCall(call.name);
         }
         part.calls = part.calls
           .filter((c) => wireNames.has(c.name))
@@ -291,21 +295,19 @@ export class Bridge {
       }
       if (!received || (last && !answered))
         throw new Fault(502, 'incomplete_stream', 'Поток Напарника завершился до ответа.');
-      pendingSearch = [];
+      serverDecisions = [];
       for (const call of serverCalls.values()) {
-        if (call.name !== ITS_SEARCH)
-          throw new Fault(502, 'unsupported_server_tool', 'Напарник запросил неподдерживаемый инструмент: ' + call.name);
-        if (accepted.has(call.id))
-          throw new Fault(502, 'repeated_tool_call', 'Напарник повторил уже подтверждённый вызов поиска.');
-        accepted.add(call.id);
-        pendingSearch.push({ tool_call_id: call.id, status: 'accepted', content: null });
+        if (reviewed.has(call.id))
+          throw new Fault(502, 'repeated_tool_call', 'Напарник повторил уже рассмотренный вызов инструмента.');
+        reviewed.add(call.id);
+        serverDecisions.push({ tool_call_id: call.id, status: 'accepted', content: null });
       }
-      if (pendingSearch.length && !calls.length) {
-        turns.push({ role: 'tool', content: pendingSearch });
+      if (serverDecisions.length && !calls.length) {
+        turns.push({ role: 'tool', content: serverDecisions });
       }
     }
     const reply = { role: 'assistant', content: text, calls };
-    this.history.set(fingerprint([...messages, reply]), { conversation, parent, pendingSearch });
+    this.history.set(fingerprint([...messages, reply]), { conversation, parent, serverDecisions, clientNames: knownClientNames });
     if (this.history.size > 1024) this.history.delete(this.history.keys().next().value);
     return reply;
   }

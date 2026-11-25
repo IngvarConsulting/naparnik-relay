@@ -60,6 +60,7 @@ export function completion(res, anthropic, stream, messages) {
     res.once('close', () => clearInterval(timer));
   }
   return {
+    waiting() { if (stream) start(); },
     part(part) {
       if (!stream) return;
       start();

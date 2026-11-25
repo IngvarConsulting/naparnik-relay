@@ -98,3 +98,14 @@ progress::-moz-progress-bar { background: var(--green); }
   #secret { margin-bottom: 6px; }
   .form-actions { margin-top: 9px; }
 }
+.tools-link { text-decoration: none; }
+.back-link { color: var(--muted); text-decoration: none; font-size: 22px; padding: 0 5px; }
+#tool-source { width: 100%; margin-top: 8px; padding: 5px; font: inherit; color: var(--ink); background: white; border: 1px solid var(--line); border-radius: 6px; }
+#tool-list { list-style: none; margin: 8px 0; padding: 0; }
+#tool-list li { padding: 5px 0; border-bottom: 1px solid var(--line); font: 12px/15px ui-monospace, monospace; overflow-wrap: anywhere; }
+#tool-list small { color: var(--muted); font: 11px/14px system-ui, sans-serif; }
+#tool-list small { display: block; }
+.tool-pager { display: flex; align-items: center; gap: 8px; }
+.tool-pager { justify-content: center; color: var(--muted); font-size: 12px; }
+.tool-pager button { border: 1px solid var(--line); border-radius: 6px; background: white; padding: 2px 9px; }
+.tool-pager button:disabled { opacity: .35; }

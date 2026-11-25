@@ -1,3 +1,4 @@
+import { startToolMonitor } from './tools.js';
 const $ = (id) => document.getElementById(id);
 let state,
   profile = 'zcode',
@@ -89,7 +90,9 @@ for (const button of document.querySelectorAll('.copy'))
   };
 function showPage() {
   const auth = location.hash === '#account' && Boolean(state);
-  $('home').hidden = auth;
+  const tools = location.hash === '#tools' && Boolean(state);
+  $('tools').hidden = !tools;
+  $('home').hidden = auth || tools;
   $('auth').hidden = !auth;
   $('quota').open = false;
   $('account').reset();
@@ -101,6 +104,8 @@ function showPage() {
     $('secret').placeholder = state.configured ? 'Введите новый ключ' : 'Вставьте ключ';
     $('connect').textContent = state.configured ? 'Заменить ключ' : 'Подключить';
     $('auth-title').focus();
+  } else if (tools) {
+    $('tools-title').focus();
   } else {
     $('manage').focus({preventScroll:true});
   }
@@ -165,12 +170,13 @@ pick(profile);
 
 try {
   const token = location.hash.slice(1);
-  if (token && token !== 'account' && token !== 'home') {
+  if (token && token !== 'account' && token !== 'home' && token !== 'tools') {
     history.replaceState(null, '', location.pathname);
     await api('session', 'POST', { token });
   }
+  startToolMonitor(api);
   await update(true);
-  if (location.hash === '#account') showPage();
+  showPage();
   setInterval(() => {
     if (!document.hidden && $('auth').hidden)
       update(Boolean(state?.configured && Date.now() - new Date(state.checked).getTime() > 60000));
