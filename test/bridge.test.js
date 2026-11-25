@@ -158,6 +158,23 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.deepEqual(log.history.map(row => [row.protocol, row.name]), [
     ['OpenAI','mcp__web__fetch'], ['Anthropic','mcp__web__fetch']
   ]);
+  const sessionHeaders = { ...oa, 'x-session-id': 'chat-A' };
+  const chat = [{role: 'user', content: 'permission'}];
+  await Promise.all([
+    post('chat/completions', {messages: chat, tools}, sessionHeaders),
+    post('messages', {messages: chat, tools: aTools}, {...an, 'x-deepseek-harness-session-id': 'chat-A'}),
+    post('chat/completions', {messages: chat, tools}, {...oa, 'x-session-id': 'chat-B'})
+  ]);
+  assert.equal((await post('chat/completions', {messages: [{role:'user', content:'now empty'}]}, sessionHeaders)).status, 200);
+  const grouped = await (await request('/panel/tools', undefined, header)).json();
+  assert.equal(grouped.sessions.length, 3);
+  assert.deepEqual(grouped.sessions.find(s => s.id === 'chat-A' && s.protocol === 'OpenAI').tools, []);
+  assert.deepEqual(grouped.sessions.find(s => s.protocol === 'Anthropic').tools, ['lookup']);
+  assert.deepEqual(grouped.sessions.find(s => s.id === 'chat-B').tools, ['lookup']);
+  for (const session of grouped.sessions) {
+    assert.deepEqual(session.history.map(h => [h.protocol, h.name]), [[session.protocol, 'mcp__web__fetch']]);
+  }
+  assert.deepEqual(grouped.history, log.history);
   breaking = true;
   const bad = await post('messages', { messages }, an);
   assert.equal(bad.status, 402);

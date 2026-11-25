@@ -42,13 +42,36 @@ function toolRow(name, call) {
 export function startToolMonitor(api) {
   const sources = [...document.querySelectorAll('.tool-sources button')];
   const list = $('tool-list');
-  let previousItems;
+  const picker = $('tool-session');
+  let selected, previousOptions, previousItems;
   let snapshot, source = 'server', polling = false, failed = false;
 
   function render() {
+    const sessions = snapshot?.sessions ?? [];
+    const keyOf = s => JSON.stringify([s.protocol, s.id]);
+    const options = sessions.map(s => {
+      const id = s.id.length > 18 ? '…' + s.id.slice(-12) : s.id;
+      const when = new Date(s.updated).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      return [keyOf(s), s.protocol + ' · ' + when + ' · ' + id];
+    });
+    options.push(['', 'Без сессии']);
+    const optionSignature = JSON.stringify(options);
+    if (optionSignature !== previousOptions) {
+      picker.replaceChildren(...options.map(([value, name]) => new Option(name, value)));
+      previousOptions = optionSignature;
+    }
+    if (selected === undefined && sessions.length) selected = options[0][0];
+    picker.value = selected ?? '';
+    const session = sessions.find(s => keyOf(s) === picker.value);
+    if (session && source !== 'server' && source !== session.protocol) source = session.protocol;
+    for (const tab of sources) {
+      tab.hidden = Boolean(session && tab.dataset.source !== 'server' && tab.dataset.source !== session.protocol);
+      tab.setAttribute('aria-pressed', String(tab.dataset.source === source));
+    }
     const server = source === 'server';
-    const items = (server ? snapshot?.history : snapshot?.clients?.[source]) ?? [];
-    $('tool-kind').textContent = server ? 'Вызовы на сервере' : 'Инструменты, объявленные агентом';
+    const items = server ? (session?.history ?? snapshot?.history ?? [])
+      : session ? session.tools : (snapshot?.clients?.[source] ?? []);
+    $('tool-kind').textContent = server ? 'Вызовы на сервере' : session ? 'Инструменты последнего запроса' : 'Все объявленные инструменты';
     $('tool-total').textContent = snapshot ? String(items.length) : '';
     list.hidden = failed || !items.length;
     const signature = JSON.stringify(items);
@@ -71,7 +94,8 @@ export function startToolMonitor(api) {
     feedback.hidden = Boolean(items.length) && !failed;
     if (failed) feedback.textContent = 'Не удалось обновить список. Повторяем запрос…';
     else if (!snapshot) feedback.textContent = 'Загружаем инструменты…';
-    else if (!items.length) feedback.textContent = server ? 'Серверных вызовов пока нет.' : 'Агент пока не передавал инструменты по этому протоколу.';
+    else if (!items.length) feedback.textContent = server ? 'Серверных вызовов пока нет.' : session
+      ? 'В последнем запросе агент не объявил инструментов.' : 'Агент пока не передавал инструменты по этому протоколу.';
   }
   async function poll() {
     if (polling || document.hidden || location.hash !== '#tools') return;
@@ -83,10 +107,15 @@ export function startToolMonitor(api) {
     finally { polling = false; }
     render();
   }
+  picker.onchange = () => {
+    selected = picker.value;
+    list.scrollTop = 0;
+    previousItems = undefined;
+    render();
+  };
   for (const button of sources) button.onclick = () => {
     if (source === button.dataset.source) return;
     source = button.dataset.source;
-    for (const tab of sources) tab.setAttribute('aria-pressed', String(tab === button));
     list.scrollTop = 0;
     previousItems = undefined;
     render();

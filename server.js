@@ -197,7 +197,8 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           const input = await body(req),
             payload = normalize(input, anthropic);
           const protocol = anthropic ? 'Anthropic' : 'OpenAI';
-          monitor.observe(protocol, (Array.isArray(input.tools) ? input.tools : []).map(t => (anthropic ? t : t?.function)?.name).filter(n => typeof n === 'string'));
+          const sessionId = (anthropic ? req.headers['x-deepseek-harness-session-id'] : undefined) ?? req.headers['x-session-id'];
+          const session = monitor.observe(protocol, (Array.isArray(input.tools) ? input.tools : []).map(t => (anthropic ? t : t?.function)?.name).filter(n => typeof n === 'string'), sessionId?.trim());
           const format = completion(res, anthropic, input.stream === true, input.stream_options?.include_usage === true);
           const abort = new AbortController();
           res.on('close', () => {
@@ -210,7 +211,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             const signal = AbortSignal.any([abort.signal, accountLifetime.signal]);
             const answer = await bridge.generate(key, payload, signal, format.part, (name) => {
               format.waiting();
-              monitor.serverCall(protocol, name);
+              monitor.serverCall(protocol, name, session);
             }, format.metrics);
             format.finish(answer);
           } catch (e) {
