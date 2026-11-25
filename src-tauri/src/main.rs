@@ -32,9 +32,14 @@ impl Service {
 
 fn show_panel(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let reopening =
+            !window.is_visible().unwrap_or(true) || window.is_minimized().unwrap_or(false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        if reopening {
+            let _ = window.eval("window.dispatchEvent(new Event('relay-panel-opened'))");
+        }
     }
 }
 

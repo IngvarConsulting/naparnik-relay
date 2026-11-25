@@ -3,6 +3,7 @@ const $ = (id) => document.getElementById(id);
 let state,
   profile = 'zcode',
   toastTimer,
+  opening = true,
   pending = false;
 function toast(message) {
   clearTimeout(toastTimer);
@@ -47,6 +48,12 @@ function render(data) {
   for (const button of document.querySelectorAll('.copy')) button.disabled = false;
   renderLimits(data.problem ? null : data.limits, data.configured);
   pick(profile);
+  if (opening) {
+    opening = false;
+    if (!data.configured || data.problem?.status === 401)
+      history.replaceState(null, '', '#account');
+    if ($('auth').hidden) showPage();
+  }
 }
 function renderLimits(limits, configured) {
   const hint = [];
@@ -103,7 +110,8 @@ function showPage() {
     $('unlink').hidden = !state.configured;
     $('secret').placeholder = state.configured ? 'Введите новый ключ' : 'Вставьте ключ';
     $('connect').textContent = state.configured ? 'Заменить ключ' : 'Подключить';
-    $('auth-title').focus();
+    if (!state.configured || state.problem?.status === 401) $('secret').focus();
+    else $('auth-title').focus();
   } else if (tools) {
     $('tools-title').focus();
   } else {
@@ -166,6 +174,10 @@ async function update(check = false) {
   }
 }
 $('refresh').onclick = () => update(true);
+window.addEventListener('relay-panel-opened', () => {
+  opening = true;
+  update();
+});
 pick(profile);
 
 try {
@@ -176,7 +188,6 @@ try {
   }
   startToolMonitor(api);
   await update(true);
-  showPage();
   setInterval(() => {
     if (!document.hidden && $('auth').hidden)
       update(Boolean(state?.configured && Date.now() - new Date(state.checked).getTime() > 60000));
