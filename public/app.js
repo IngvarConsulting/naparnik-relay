@@ -95,7 +95,7 @@ function showPage() {
   $('account').reset();
   $('error').textContent = '';
   if (auth) {
-    $('remember').checked = state.saved;
+    $('remember').checked = !state.configured || state.saved;
     $('auth-state').textContent = state.problem?.message || (state.configured ? 'Аккаунт подключён' : 'Подключите аккаунт по API-ключу.');
     $('unlink').hidden = !state.configured;
     $('secret').placeholder = state.configured ? 'Введите новый ключ' : 'Вставьте ключ';

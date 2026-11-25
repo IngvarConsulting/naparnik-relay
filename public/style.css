@@ -65,7 +65,7 @@ progress::-moz-progress-bar { background: var(--green); }
 #week::-moz-progress-bar { background: #427ac1; }
 .quota-panel small { display: block; color: var(--muted); font-size: 11px; }
 #quota-note:not(:empty) { margin-top: 9px; }
-.auth-state { margin: 4px 0 16px; color: var(--muted); font-size: 13px; }
+.auth-overview { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0 16px; color: var(--muted); font-size: 13px; }
 .key-label, .form-actions, .remember { display: flex; align-items: center; gap: 8px; }
 .key-label { justify-content: space-between; font-size: 13px; }
 .key-label label { font-weight: 600; }
@@ -73,7 +73,9 @@ progress::-moz-progress-bar { background: var(--green); }
 #secret { width: 100%; padding: 9px 11px; border-radius: 7px; border: 1px solid #aebeb6; margin: 5px 0 10px; }
 .remember { font-size: 13px; }
 .remember input { margin: 0; accent-color: var(--green); }
-.form-actions { margin-top: 16px; justify-content: space-between; }
+.form-actions { margin-top: 10px; gap: 12px; }
+.form-actions .primary { flex: none; }
+#unlink { flex: none; }
 .primary { background: var(--green); color: white; border: 0; padding: 8px 14px; border-radius: 7px; }
 .unlink, .error { color: #983b27; font-size: 12px; }
 .error { margin-top: 5px; }
@@ -91,7 +93,7 @@ progress::-moz-progress-bar { background: var(--green); }
   .fields { gap: 6px; }
   .field { padding-block: 5px 6px; gap: 2px; }
   footer { margin-top: 6px; padding-top: 4px; }
-  .auth-state { margin-block: 3px 9px; }
+  .auth-overview { margin-block: 3px 9px; }
   #secret { margin-bottom: 6px; }
   .form-actions { margin-top: 9px; }
 }
