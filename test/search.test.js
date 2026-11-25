@@ -26,7 +26,7 @@ function service(rounds) {
   return { bridge, posts };
 }
 const run = (bridge, body = query, controller = new AbortController(), part = () => {}, onServerCall) =>
-  bridge.generate('fixture', body, controller.signal, part, onServerCall);
+  bridge.generate('fixture', { ...body, protocol: 'OpenAI', sessionId: 'search' }, controller.signal, part, onServerCall);
 
 test('Поиск ИТС: групповые и повторные запросы остаются в одном диалоге', async () => {
   const { bridge, posts } = service([

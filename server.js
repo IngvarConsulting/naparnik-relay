@@ -7,7 +7,7 @@ import { completion } from './formats.js';
 import { join } from 'node:path';
 import { SessionTitles } from './session-titles.js';
 import { ToolMonitor } from './tool-monitor.js';
-import { load, save, port, origin, dir } from './state.js';
+import { load, save, port, origin, dir, SessionBindings } from './state.js';
 
 const assets = new Map([
   ['/', ['index.html', 'text/html']],
@@ -32,10 +32,13 @@ async function body(req) {
     throw new Fault(400, 'invalid_json', 'Ожидается JSON.');
   }
 }
-export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor() } = {}) {
+export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor(), profileDir = dir } = {}) {
   const sessionTitles = new SessionTitles();
-  let bridge = new Bridge(upstream),
-    key = connection.upstream,
+  function newBridge(key) {
+    return new Bridge(upstream, key ? new SessionBindings(profileDir, key) : undefined);
+  }
+  let key = connection.upstream,
+    bridge = newBridge(key),
     busy = false,
     revision = 0,
     accountLifetime = new AbortController();
@@ -54,7 +57,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
     revision++;
     accountLifetime.abort();
     accountLifetime = new AbortController();
-    bridge = new Bridge(upstream);
+    bridge = newBridge(key);
     limits = checked = problem = refresh = null;
     recent = [];
   }
@@ -196,16 +199,17 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           });
         if ((anthropic || path === '/v1/chat/completions') && method === 'POST') {
           if (!key) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
+          const harnessId = anthropic && req.headers['x-deepseek-harness-session-id']?.trim();
           const input = await body(req),
-            payload = normalize(input, anthropic);
+            payload = normalize(input, anthropic, harnessId);
           const protocol = anthropic ? 'Anthropic' : 'OpenAI';
-          const sessionId = (anthropic ? req.headers['x-deepseek-harness-session-id'] : undefined) ?? req.headers['x-session-id'];
+          const sessionId = harnessId || req.headers['x-session-id']?.trim();
           const declared = Array.isArray(input.tools)
             ? input.tools.map(t => (anthropic ? t : t?.function)?.name).filter(name => typeof name === 'string')
             : undefined;
           const agent = anthropic && req.headers['x-deepseek-harness-session-id'] ? 'DeepSeek Harness'
             : !anthropic && req.headers['x-zcode-session-type'] ? 'ZCode' : undefined;
-          const session = monitor.observe(protocol, declared, sessionId?.trim(), agent);
+          const session = monitor.observe(protocol, declared, sessionId, agent);
           const format = completion(res, anthropic, input.stream === true, input.stream_options?.include_usage === true);
           const abort = new AbortController();
           res.on('close', () => {
@@ -216,7 +220,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           let outcome = 'Готово';
           try {
             const signal = AbortSignal.any([abort.signal, accountLifetime.signal]);
-            const answer = await bridge.generate(key, payload, signal, format.part, (name) => {
+            const answer = await bridge.generate(key, { ...payload, protocol, sessionId }, signal, format.part, (name) => {
               format.waiting();
               monitor.serverCall(protocol, name, session);
             }, format.metrics);

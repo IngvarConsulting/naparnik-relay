@@ -31,7 +31,46 @@ function assistant(content, calls = []) {
     calls: calls.map((c) => ({ id: c.id, name: c.function.name, args: c.function.arguments }))
   };
 }
-export function normalize(body, anthropic) {
+const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const clientStatuses = new Set(['ok', 'error', 'timeout', 'rejected', 'ignored']);
+
+function harnessResults(log, sessionId) {
+  const results = new Map();
+  if (!sessionId || log?.session?.id !== sessionId || !Array.isArray(log.events)) return results;
+  for (const event of log.events) {
+    const message = event?.data?.message;
+    if (event?.type === 'tool/result' && message?.role === 'tool' && typeof message.toolCallId === 'string')
+      results.set(message.toolCallId, event.data);
+  }
+  return results;
+}
+
+function clientResult(id, result, event) {
+  requireInput(typeof id === 'string' && id.length, 'Отсутствует ID вызова инструмента.');
+  const message = event?.message;
+  const status = result.status ?? message?.status ?? ((result.is_error ?? message?.isError) ? 'error' : 'ok');
+  requireInput(clientStatuses.has(status), 'Неизвестный статус результата клиентского инструмента.');
+  const nullable = status === 'ignored' || status === 'rejected';
+  const content = nullable && result.content == null ? null : textContent(result.content ?? '');
+  requireInput(status !== 'ignored' || content === null || content === '', 'Статус ignored предполагает пустой результат.');
+
+  const structured = result.structured_content ?? result.structuredContent ??
+    message?.structured_content ?? message?.structuredContent;
+  let details = result.details ?? message?.details;
+  if (details == null && (isObject(event?.meta) || isObject(event?.error))) {
+    details = { ...event.meta };
+    if (isObject(event.error)) details.error = event.error;
+  }
+  requireInput(structured == null || isObject(structured), 'Поле structured_content должно быть объектом.');
+  requireInput(details == null || isObject(details), 'Поле details должно быть объектом.');
+  return {
+    role: 'tool', id, status, content: status === 'ignored' ? null : content,
+    ...(structured != null && { structured_content: structured }),
+    ...(details != null && { details })
+  };
+}
+
+export function normalize(body, anthropic, harnessSessionId) {
   requireInput(body && typeof body === 'object' && body.model === MODEL, 'Укажите модель naparnik.');
   requireInput(Array.isArray(body.messages) && body.messages.length, 'Нужен массив messages.');
   requireInput(!body.n || body.n === 1, 'Поддерживается один ответ на запрос.');
@@ -44,6 +83,7 @@ export function normalize(body, anthropic) {
     !choice || ['none', 'auto'].includes(choice),
     'Доступен автоматический выбор инструмента или none.'
   );
+  const events = harnessResults(body.dsh_session_log, anthropic && harnessSessionId);
   const messages = [];
   if (body.system) messages.push({ role: 'system', content: textContent(body.system) });
   for (const msg of body.messages) {
@@ -69,21 +109,14 @@ export function normalize(body, anthropic) {
       } else {
         for (const block of msg.content) {
           if (block?.type === 'tool_result') {
-            requireInput(typeof block.tool_use_id === 'string', 'Отсутствует tool_use_id.');
-            messages.push({
-              role: 'tool',
-              id: block.tool_use_id,
-              content: textContent(block.content ?? ''),
-              status: block.is_error ? 'error' : 'ok'
-            });
+            messages.push(clientResult(block.tool_use_id, block, events.get(block.tool_use_id)));
           } else messages.push({ role: msg.role, content: textContent([block]) });
         }
       }
     } else if (msg.role === 'assistant')
       messages.push(assistant(textContent(msg.content ?? ''), msg.tool_calls));
     else if (msg.role === 'tool') {
-      requireInput(typeof msg.tool_call_id === 'string', 'Отсутствует tool_call_id.');
-      messages.push({ role: 'tool', id: msg.tool_call_id, content: textContent(msg.content), status: 'ok' });
+      messages.push(clientResult(msg.tool_call_id, msg));
     } else messages.push({ role: msg.role, content: textContent(msg.content) });
   }
   requireInput(
@@ -104,20 +137,6 @@ export function normalize(body, anthropic) {
   return { messages, tools };
 }
 
-function fingerprint(messages) {
-  // Clients may reserialize the JSON arguments between turns.
-  const canonical = JSON.stringify(messages, (k, v) => {
-    if (k === 'args') {
-      try {
-        return JSON.parse(v);
-      } catch {
-        return v;
-      }
-    }
-    return v;
-  });
-  return createHash('sha256').update(canonical).digest('hex');
-}
 async function* packets(stream) {
   const decoder = new TextDecoder();
   let buffer = '',
@@ -176,9 +195,10 @@ function providerUsage(value) {
   };
 }
 export class Bridge {
-  constructor(base = 'https://code.1c.ai/public/v1') {
+  constructor(base = 'https://code.1c.ai/public/v1', sessions = new Map()) {
     this.base = base;
-    this.history = new Map();
+    this.sessions = sessions;
+    this.pending = new Map();
   }
   async request(key, path, body, signal, stream = false) {
     const timeout = AbortSignal.timeout(stream ? 600000 : 20000);
@@ -207,7 +227,28 @@ export class Bridge {
       throw new Fault(502, 'bad_budget', 'Напарник вернул неизвестный формат лимитов.');
     return limits;
   }
-  async generate(key, { messages, tools }, signal, onPart, onServerCall = () => {}, onMetrics) {
+  async generate(key, payload, signal, onPart, onServerCall = () => {}, onMetrics) {
+    const { protocol, sessionId } = payload;
+    const id = sessionId ? JSON.stringify([protocol, sessionId]) : null;
+    const run = async () => {
+      signal.throwIfAborted();
+      const previous = id && this.sessions.get(id);
+      const { reply, state } = await this.generateTurn(key, payload, previous, signal, onPart, onServerCall, onMetrics);
+      if (id) this.sessions.set(id, state);
+      return reply;
+    };
+    if (!id) return run();
+    // Read the cursor only after the preceding turn has finished.
+    const turn = (this.pending.get(id) ?? Promise.resolve()).then(run);
+    const settled = turn.catch(() => {});
+    this.pending.set(id, settled);
+    try {
+      return await turn;
+    } finally {
+      if (this.pending.get(id) === settled) this.pending.delete(id);
+    }
+  }
+  async generateTurn(key, { messages, tools }, previous, signal, onPart, onServerCall, onMetrics) {
     // The provider reserves tool names (including ZCode's TodoWrite). Give
     // client tools their own wire names and restore them in public responses.
     signal = AbortSignal.any([signal, AbortSignal.timeout(600000)]);
@@ -221,11 +262,9 @@ export class Bridge {
       wireNames.set(wireName, tool.name);
       return { ...tool, name: wireName };
     });
-    let split = messages.length;
-    while (split && messages[split - 1].role !== 'assistant') split--;
-    const previous = split && this.history.get(fingerprint(messages.slice(0, split)));
     const knownClientNames = new Set([...(previous?.clientNames ?? []), ...wireNames.keys()]);
-    const tail = previous ? messages.slice(split) : messages;
+    // Clients resend the transcript. Only send the new inputs to an existing dialogue.
+    const tail = previous ? messages.slice(messages.findLastIndex(msg => msg.role === 'assistant') + 1) : messages;
     let conversation = previous?.conversation,
       parent = previous?.parent ?? null;
     if (!conversation) {
@@ -244,7 +283,8 @@ export class Bridge {
     const turns = [];
     for (const msg of tail) {
       if (previous && msg.role === 'tool') {
-        const item = { tool_call_id: msg.id, content: msg.content, status: msg.status };
+        const { role, id, ...result } = msg;
+        const item = { tool_call_id: id, ...result };
         if (turns.at(-1)?.role === 'tool') turns.at(-1).content.push(item);
         else turns.push({ role: 'tool', content: [item] });
       } else {
@@ -341,8 +381,6 @@ export class Bridge {
       onMetrics(usage, context);
     }
     const reply = { role: 'assistant', content: text, calls };
-    this.history.set(fingerprint([...messages, reply]), { conversation, parent, serverDecisions, clientNames: knownClientNames });
-    if (this.history.size > 1024) this.history.delete(this.history.keys().next().value);
-    return reply;
+    return { reply, state: { conversation, parent, serverDecisions, clientNames: knownClientNames } };
   }
 }

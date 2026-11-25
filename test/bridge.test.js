@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { once } from 'node:events';
 import { createServer } from '../server.js';
 
@@ -54,7 +57,10 @@ test('Оба клиента, ключи, история, поток и ошиб�
   });
   mock.listen(0, '127.0.0.1');
   await once(mock, 'listening');
+  const profileDir = mkdtempSync(join(tmpdir(), 'relay-bridge-'));
+  t.after(() => rmSync(profileDir, { recursive: true, force: true }));
   const app = createServer({
+    profileDir,
     connection: { admin: 'panel-fixture', localKey: 'local-fixture', upstream: '' },
     persist: (data) => accounts.push(data),
     upstream: 'http://127.0.0.1:' + mock.address().port
@@ -91,7 +97,9 @@ test('Оба клиента, ключи, история, поток и ошиб�
   const tools = [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }];
   const messages = [{ role: 'user', content: 'tool' }];
   const post = (path, body, headers) => request('/v1/' + path, { model: 'naparnik', ...body }, headers);
-  const result = await (await post('chat/completions', { messages, tools }, oa)).json();
+  const zcode = { ...oa, 'x-session-id': 'zcode-tools' };
+  const deepseek = { ...an, 'x-deepseek-harness-session-id': 'deepseek-tools' };
+  const result = await (await post('chat/completions', { messages, tools }, zcode)).json();
   assert.deepEqual(result.naparnik_context, {token_count:101,max_context_length:384000});
   assert.equal(result.usage.total_tokens,100);
   const reply = result.choices[0].message;
@@ -107,7 +115,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
         stream_options: {include_usage:true},
         stream: true
       },
-      oa
+      zcode
     )
   ).text();
   assert.match(next, /Готово/);
@@ -118,7 +126,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.equal(received[1].body.parent_uuid, 'answer');
   assert.deepEqual(received[1].body.content, [{ tool_call_id: 'call-1', content: '42', status: 'ok' }]);
   const aTools = [{ name: 'lookup', input_schema: { type: 'object' } }];
-  const a = await (await post('messages', { messages, tools: aTools, max_tokens: 50 }, an)).json();
+  const a = await (await post('messages', { messages, tools: aTools, max_tokens: 50 }, deepseek)).json();
   assert.deepEqual(a.usage, {input_tokens:26, cache_read_input_tokens:64, output_tokens:10});
   assert.deepEqual(a.content, [{ type: 'tool_use', name: 'lookup', id: 'call-1', input: { x: 1 } }]);
   const s = await (
@@ -133,7 +141,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
         tools: aTools,
         stream: true
       },
-      an
+      deepseek
     )
   ).text();
   assert.match(s, /event: message_stop/);
@@ -146,7 +154,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.equal(received.at(-1).body.role, 'tool');
   assert.equal(received.at(-1).url, received.at(-2).url);
   const inventory = await (await request('/panel/tools', undefined, header)).json();
-  assert.deepEqual(inventory.clients, {OpenAI:['lookup'], Anthropic:['lookup']});
+  assert.deepEqual(inventory.sessions.map(s => s.tools), [['lookup'], ['lookup']]);
   assert.equal((await request('/panel/tools', undefined, oa)).status, 403);
   for (const [path, headers] of [['messages', an], ['chat/completions', oa]]) {
     const final = post(path, {messages:[{role:'user', content:'permission'}], stream:true}, headers);
@@ -168,13 +176,13 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.equal((await post('messages', {messages: [{role:'user', content:'title'}]}, {...an, 'x-deepseek-harness-session-id': 'chat-A'})).status, 200);
   assert.equal((await post('chat/completions', {messages: [{role:'user', content:'now empty'}], tools: []}, sessionHeaders)).status, 200);
   const grouped = await (await request('/panel/tools', undefined, header)).json();
-  assert.equal(grouped.sessions.length, 3);
+  assert.equal(grouped.sessions.length, 5);
   assert.deepEqual(grouped.sessions.find(s => s.id === 'chat-A' && s.protocol === 'OpenAI').tools, []);
-  const harness = grouped.sessions.find(s => s.protocol === 'Anthropic');
+  const harness = grouped.sessions.find(s => s.id === 'chat-A' && s.protocol === 'Anthropic');
   assert.deepEqual(harness.tools, ['lookup']);
   assert.equal(harness.lastRequestDeclaredTools, false);
   assert.deepEqual(grouped.sessions.find(s => s.id === 'chat-B').tools, ['lookup']);
-  for (const session of grouped.sessions) {
+  for (const session of grouped.sessions.filter(s => s.id.startsWith('chat-'))) {
     assert.deepEqual(session.history.map(h => [h.protocol, h.name]), [[session.protocol, 'mcp__web__fetch']]);
   }
   assert.deepEqual(grouped.history, log.history);
@@ -187,4 +195,45 @@ test('Оба клиента, ключи, история, поток и ошиб�
   const disconnected = await (await request('/panel/account', undefined, header, 'DELETE')).json();
   assert.equal(disconnected.configured, false);
   assert.equal((await post('messages', { messages }, an)).status, 503);
+});
+
+test('ToolContent сохраняет статусы и детали результатов DeepSeek Harness', async () => {
+  const { normalize } = await import('../bridge.js');
+  const sessionId = 'harness-fixture';
+  const callId = 'tool-read-1';
+  const details = { path: '/tmp/example.txt', lines: [{ number: 1, text: 'строка' }] };
+  const error = { name: 'FsError', code: 'FS_NOT_FOUND' };
+  const log = {
+    session: { id: sessionId },
+    events: [
+      { type: 'tool/result', data: { message: { role: 'tool', toolCallId: callId }, meta: details } },
+      { type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'tool-read-2' }, error } }
+    ]
+  };
+  const result = normalize({
+    model: 'naparnik',
+    dsh_session_log: log,
+    messages: [{ role: 'user', content: [
+      { type: 'tool_result', tool_use_id: callId, content: [{ type: 'text', text: 'содержимое' }] },
+      { type: 'tool_result', tool_use_id: 'tool-read-2', content: [{ type: 'text', text: 'не найдено' }], is_error: true }
+    ] }]
+  }, true, sessionId);
+  assert.deepEqual(result.messages, [
+    { role: 'tool', id: callId, status: 'ok', content: 'содержимое', details },
+    { role: 'tool', id: 'tool-read-2', status: 'error', content: 'не найдено', details: { error } }
+  ]);
+});
+
+test('ToolContent для ZCode получает стандартный статус по схеме OpenAI', async () => {
+  const { normalize } = await import('../bridge.js');
+  const result = normalize({
+    model: 'naparnik',
+    messages: [
+      { role: 'assistant', tool_calls: [{ id: 'tool-read-1', function: { name: 'Read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tool-read-1', content: 'не найдено' }
+    ]
+  }, false);
+  assert.deepEqual(result.messages.at(-1), {
+    role: 'tool', id: 'tool-read-1', status: 'ok', content: 'не найдено'
+  });
 });
