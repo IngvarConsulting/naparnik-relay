@@ -59,10 +59,13 @@
     </main>
     <main id="auth" hidden aria-labelledby="auth-title">
       <header class="top">
-        <h1 id="auth-title" tabindex="-1">Авторизация</h1>
-        <a class="quiet" id="back" href="#home">Назад</a>
+        <div class="auth-heading">
+          <a id="back" href="#home" aria-label="Назад" title="Назад"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7"/></svg></a>
+          <h1 id="auth-title" tabindex="-1">Авторизация</h1>
+        </div>
+        <button type="button" class="unlink" id="unlink" hidden>Отключить аккаунт</button>
       </header>
-      <div class="auth-overview"><p id="auth-state"></p><button type="button" class="unlink" id="unlink" hidden>Отключить аккаунт</button></div>
+      <p class="auth-state" id="auth-state"></p>
       <form id="account">
         <div class="key-label"><label for="secret">API-ключ Напарника</label><a href="https://code.1c.ai/api-access/" rel="noreferrer">Получить ключ ↗</a></div>
         <input id="secret" type="password" placeholder="Вставьте ключ" autocomplete="off" spellcheck="false" required>

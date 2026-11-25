@@ -65,7 +65,7 @@ progress::-moz-progress-bar { background: var(--green); }
 #week::-moz-progress-bar { background: #427ac1; }
 .quota-panel small { display: block; color: var(--muted); font-size: 11px; }
 #quota-note:not(:empty) { margin-top: 9px; }
-.auth-overview { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0 16px; color: var(--muted); font-size: 13px; }
+.auth-state { margin: 4px 0 16px; color: var(--muted); font-size: 13px; }
 .key-label, .form-actions, .remember { display: flex; align-items: center; gap: 8px; }
 .key-label { justify-content: space-between; font-size: 13px; }
 .key-label label { font-weight: 600; }
@@ -80,8 +80,9 @@ progress::-moz-progress-bar { background: var(--green); }
 .unlink, .error { color: #983b27; font-size: 12px; }
 .error { margin-top: 5px; }
 #auth-title:focus { outline: none; }
-#back { text-decoration: none; }
-#back:hover { text-decoration: underline; }
+.auth-heading { display: flex; align-items: center; gap: 5px; }
+#back { display: grid; place-items: center; width: 28px; height: 30px; border-radius: 6px; color: var(--muted); }
+#back:hover { color: var(--ink); background: #e9ede9; }
 .toast { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); background: #20342e; color: white; padding: 6px 12px; border-radius: 6px; font-size: 12px; }
 @media (max-width: 380px) { main { padding-inline: 14px; } h1 { font-size: 21px; } }
 
@@ -93,7 +94,7 @@ progress::-moz-progress-bar { background: var(--green); }
   .fields { gap: 6px; }
   .field { padding-block: 5px 6px; gap: 2px; }
   footer { margin-top: 6px; padding-top: 4px; }
-  .auth-overview { margin-block: 3px 9px; }
+  .auth-state { margin-block: 3px 9px; }
   #secret { margin-bottom: 6px; }
   .form-actions { margin-top: 9px; }
 }
