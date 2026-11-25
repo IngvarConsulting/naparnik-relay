@@ -30,6 +30,51 @@ impl Service {
     }
 }
 
+fn show_panel(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn create_tray(app: &AppHandle) -> tauri::Result<()> {
+    let open = MenuItem::with_id(
+        app,
+        "open-panel",
+        "Открыть Naparnik Relay",
+        true,
+        None::<&str>,
+    )?;
+    let update = MenuItem::with_id(
+        app,
+        "tray-update",
+        "Проверить обновления…",
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(
+        app,
+        "quit-relay",
+        "Завершить Naparnik Relay",
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(app, &[&open, &update, &separator, &quit])?;
+    #[cfg(target_os = "macos")]
+    let icon = tauri::include_image!("icons/tray.png");
+    #[cfg(not(target_os = "macos"))]
+    let icon = tauri::include_image!("icons/32x32.png");
+    tauri::tray::TrayIconBuilder::with_id("relay")
+        .icon(icon)
+        .icon_as_template(cfg!(target_os = "macos"))
+        .tooltip("Naparnik Relay")
+        .menu(&menu)
+        .build(app)?;
+    Ok(())
+}
+
 fn open_external(app: &AppHandle, target: &tauri::Url) {
     if target.scheme() == "https" && matches!(target.host_str(), Some("code.1c.ai" | "ingvar.pro"))
     {
@@ -97,6 +142,9 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Окно приложения закрыто")?;
     let handle = app.clone();
     let updater = app
         .updater_builder()
@@ -106,34 +154,31 @@ async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error +
     let Some(update) = updater.check().await? else {
         app.dialog()
             .message(format!(
-                "Установлена последняя версия {}.",
+                "Установлена последняя версия Naparnik Relay {}.",
                 app.package_info().version
             ))
-            .title("Обновления")
+            .title("Обновление Naparnik Relay")
+            .parent(&window)
             .show(|_| {});
         return Ok(());
     };
     let install = app
         .dialog()
         .message(format!(
-            "Установить версию {}? После установки шлюз перезапустится.",
-            update.version
+            "Сейчас установлена версия {}. После установки Naparnik Relay перезапустится.",
+            app.package_info().version
         ))
-        .title("Доступно обновление")
+        .title(format!("Обновить Naparnik Relay до {}?", update.version))
+        .parent(&window)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "Установить".into(),
+            "Обновить".into(),
             "Позже".into(),
         ))
         .blocking_show();
     if install {
-        let window = app.get_webview_window("main");
-        if let Some(w) = &window {
-            let _ = w.set_title("Загружаем обновление…");
-        }
+        let _ = window.set_title("Загружаем обновление…");
         let result = update.download_and_install(|_, _| {}, || {}).await;
-        if let Some(w) = &window {
-            let _ = w.set_title("Напарник · Ingvar Consulting");
-        }
+        let _ = window.set_title("Напарник · Ingvar Consulting");
         result?;
         app.state::<Service>().stop();
         app.restart();
@@ -144,11 +189,7 @@ async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error +
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.unminimize();
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            show_panel(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
@@ -178,9 +219,13 @@ fn main() {
             Menu::with_items(app, &[&relay, &edit])
         })
         .on_menu_event(|app, event| {
-            if event.id().as_ref() != "updates"
-                || app.state::<AtomicBool>().swap(true, Ordering::SeqCst)
-            {
+            match event.id().as_ref() {
+                "open-panel" => return show_panel(app),
+                "quit-relay" => return app.exit(0),
+                "updates" | "tray-update" => show_panel(app),
+                _ => return,
+            }
+            if app.state::<AtomicBool>().swap(true, Ordering::SeqCst) {
                 return;
             }
             let app = app.clone();
@@ -188,13 +233,23 @@ fn main() {
                 if let Err(e) = check_update(&app).await {
                     app.dialog()
                         .message(format!("Не удалось обновить приложение. {e}"))
-                        .title("Обновления")
+                        .title("Обновление Naparnik Relay")
                         .show(|_| {});
                 }
                 app.state::<AtomicBool>().store(false, Ordering::SeqCst);
             });
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.app_handle().tray_by_id("relay").is_some() && window.hide().is_ok() {
+                    api.prevent_close();
+                }
+            }
+        })
         .setup(|app| {
+            if let Err(e) = create_tray(app.handle()) {
+                eprintln!("Не удалось создать значок Naparnik Relay: {e}");
+            }
             if let Err(e) = open_panel(app.handle()) {
                 eprintln!("Не удалось открыть панель: {e}");
                 app.state::<Service>().stop();
@@ -209,6 +264,14 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("Не удалось создать приложение");
     app.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            show_panel(app);
+        }
         if let tauri::RunEvent::Exit = event {
             app.state::<Service>().stop();
         }
