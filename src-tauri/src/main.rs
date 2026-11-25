@@ -34,6 +34,10 @@ fn show_panel(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let reopening =
             !window.is_visible().unwrap_or(true) || window.is_minimized().unwrap_or(false);
+        #[cfg(target_os = "macos")]
+        if reopening {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        }
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -248,6 +252,10 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.app_handle().tray_by_id("relay").is_some() && window.hide().is_ok() {
                     api.prevent_close();
+                    #[cfg(target_os = "macos")]
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
             }
         })
