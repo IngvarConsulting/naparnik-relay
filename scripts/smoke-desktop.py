@@ -71,3 +71,15 @@ with tempfile.TemporaryDirectory() as tmp:
         else:
             proc.terminate()
         proc.wait(timeout=30)
+        if sys.platform == "win32":
+            # taskkill can return before Windows releases the mapped sidecar executable.
+            sidecar = install / "runtime" / "node.exe"
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    sidecar.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.2)

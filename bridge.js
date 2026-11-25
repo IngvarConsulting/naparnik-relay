@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 export const MODEL = 'naparnik';
+const ITS_SEARCH = 'mcp__knowledge-hub__Search_ITS';
 export class Fault extends Error {
   constructor(status, code, message) {
     super(message);
@@ -198,6 +199,7 @@ export class Bridge {
   async generate(key, { messages, tools }, signal, onPart) {
     // The provider reserves tool names (including ZCode's TodoWrite). Give
     // client tools their own wire names and restore them in public responses.
+    signal = AbortSignal.any([signal, AbortSignal.timeout(600000)]);
     const wireNames = new Map();
     const wireTools = tools.map((tool) => {
       const digest = createHash('sha256').update(tool.name).digest('hex').slice(0, 12);
@@ -239,9 +241,15 @@ export class Bridge {
         else turns.push({ role: 'user', content: chunk });
       }
     }
+    if (previous?.pendingSearch?.length && turns[0]?.role === 'tool') {
+      turns[0].content.push(...previous.pendingSearch);
+    }
+    const accepted = new Set((previous?.pendingSearch ?? []).map((item) => item.tool_call_id));
+    let pendingSearch = [];
     let text = '',
       calls = [];
     for (const [i, turn] of turns.entries()) {
+      signal.throwIfAborted();
       const last = i === turns.length - 1;
       const body = { ...turn, parent_uuid: parent, no_generate: !last };
       if (turn.role === 'user' && tools.length) body.tools = wireTools;
@@ -252,6 +260,7 @@ export class Bridge {
         signal,
         true
       );
+      const serverCalls = new Map();
       let received = false,
         answered = false;
       for await (const p of packets(response.body)) {
@@ -263,22 +272,40 @@ export class Bridge {
         if (!p.finished || !p.uuid) continue;
         received = true;
         parent = p.uuid;
+        if (p.role === 'tool') serverCalls.delete(p.content?.tool_call_id ?? p.details?.tool_call_id);
         if (!last || p.role !== 'assistant' || !p.content) continue;
         answered = true;
         const part = assistant(p.content.content, p.content.tool_calls ?? []);
-        // Server tools run upstream. Forward only functions declared by this client.
+        // A later assistant message in the same stream supersedes the earlier tool request.
+        serverCalls.clear();
+        for (const call of part.calls) {
+          if (!wireNames.has(call.name)) serverCalls.set(call.id, call);
+        }
         part.calls = part.calls
           .filter((c) => wireNames.has(c.name))
           .map((c) => ({ ...c, name: wireNames.get(c.name) }));
+        if (text && part.content) part.content = '\n\n' + part.content;
         text += part.content;
         calls.push(...part.calls);
         if (part.content || part.calls.length) onPart(part);
       }
       if (!received || (last && !answered))
         throw new Fault(502, 'incomplete_stream', 'Поток Напарника завершился до ответа.');
+      pendingSearch = [];
+      for (const call of serverCalls.values()) {
+        if (call.name !== ITS_SEARCH)
+          throw new Fault(502, 'unsupported_server_tool', 'Напарник запросил неподдерживаемый инструмент: ' + call.name);
+        if (accepted.has(call.id))
+          throw new Fault(502, 'repeated_tool_call', 'Напарник повторил уже подтверждённый вызов поиска.');
+        accepted.add(call.id);
+        pendingSearch.push({ tool_call_id: call.id, status: 'accepted', content: null });
+      }
+      if (pendingSearch.length && !calls.length) {
+        turns.push({ role: 'tool', content: pendingSearch });
+      }
     }
     const reply = { role: 'assistant', content: text, calls };
-    this.history.set(fingerprint([...messages, reply]), { conversation, parent });
+    this.history.set(fingerprint([...messages, reply]), { conversation, parent, pendingSearch });
     if (this.history.size > 1024) this.history.delete(this.history.keys().next().value);
     return reply;
   }
