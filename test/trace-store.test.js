@@ -32,6 +32,42 @@ test('Трассировка разделяет параллельные сес�
   assert.equal(traces.snapshot('openai:S').exchanges[0].client[0].body.model, 'naparnik');
 });
 
+test('Подтверждённый диалог объединяет только обмены без ID сессии того же протокола', () => {
+  const traces = new TraceStore({ maxExchangesPerSession: 2 });
+  const start = traces.begin({ protocol: 'OpenAI', title: 'Первый запрос' });
+  const startId = start.sessionId;
+  start.conversation('Chat-1');
+  const next = traces.begin({ protocol: 'OpenAI', title: 'Продолжение' });
+  const provisionalId = next.sessionId;
+  assert.notEqual(provisionalId, startId);
+  const sent = next.record('client', { kind: 'request' });
+  next.conversation('chat-1');
+  next.record('upstream', { kind: 'request', source: sent });
+  assert.equal(next.sessionId, startId);
+  assert.deepEqual(traces.snapshot(provisionalId).exchanges, []);
+  const merged = traces.snapshot(startId);
+  assert.deepEqual(merged.exchanges.map(exchange => [exchange.id, exchange.conversation]), [
+    [start.id, 'chat-1'], [next.id, 'chat-1']
+  ]);
+  assert.equal(merged.sessions.find(session => session.id === startId).title, 'Первый запрос');
+  assert.equal(merged.exchanges[1].upstream[0].source, sent);
+
+  const otherProtocol = traces.begin({ protocol: 'Anthropic' });
+  otherProtocol.conversation('chat-1');
+  assert.notEqual(otherProtocol.sessionId, startId);
+  const named = traces.begin({ protocol: 'OpenAI', sessionId: 'custom-client-session' });
+  named.conversation('chat-1');
+  assert.equal(named.sessionId, 'custom-client-session');
+  assert.equal(traces.snapshot(named.sessionId).exchanges[0].conversation, 'chat-1');
+
+  const more = traces.begin({ protocol: 'OpenAI' });
+  more.conversation('chat-1');
+  assert.deepEqual(traces.snapshot(startId).exchanges.map(exchange => exchange.id), [next.id, more.id]);
+  traces.clear();
+  more.conversation('chat-1');
+  assert.deepEqual(traces.snapshot(startId), { sessions: [], exchanges: [] });
+});
+
 test('Имена событий и терминатор SSE сохраняются вместе с источником', () => {
   const traces = new TraceStore();
   const exchange = traces.begin({ sessionId: 'S' });

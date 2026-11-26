@@ -304,7 +304,10 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           const harnessId = anthropic && req.headers['x-deepseek-harness-session-id']?.trim();
           const input = await body(req);
           const protocol = anthropic ? 'Anthropic' : 'OpenAI';
-          const sessionId = harnessId || req.headers['x-session-id']?.trim();
+          const querySource = !anthropic && req.headers['x-zcode-query-source']?.trim();
+          // ZCode's auxiliary completions can share the main turn's session ID.
+          const sessionId = querySource && querySource !== 'main_turn'
+            ? undefined : harnessId || req.headers['x-session-id']?.trim();
           const traceSessionId = sessionId ? JSON.stringify([protocol, sessionId]) : undefined;
           trace = beginTrace(protocol, traceSessionId);
           trace.requestId = trace.record('client', { kind: 'request', method, path, body: input });
@@ -317,7 +320,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             ? input.tools.map(t => (anthropic ? t : t?.function)?.name).filter(name => typeof name === 'string')
             : undefined;
           const agent = anthropic && req.headers['x-deepseek-harness-session-id'] ? 'DeepSeek Harness'
-            : !anthropic && req.headers['x-zcode-session-type'] ? 'ZCode' : undefined;
+            : !anthropic && (querySource || req.headers['x-zcode-session-type']) ? 'ZCode' : undefined;
           const session = monitor.observe(protocol, declared, sessionId, agent);
           const stream = input.stream === true;
           const format = completion(res, anthropic, stream, input.stream_options?.include_usage === true, trace);
@@ -339,6 +342,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
               onConversation: id => {
                 res.setHeader('X-Relay-Conversation-Id', id);
                 if (revision === generation) {
+                  trace.conversation(id);
                   const conversation = id.toLowerCase();
                   traceConversations.delete(conversation);
                   traceConversations.set(conversation, { id: trace.sessionId, protocol });

@@ -180,6 +180,7 @@ const packetSources = new WeakMap();
 
 async function* packets(stream, signal, trace, clientToolNames) {
   const decoder = new TextDecoder();
+  const done = Symbol();
   let buffer = '',
     lines = [];
   function parse() {
@@ -188,18 +189,19 @@ async function* packets(stream, signal, trace, clientToolNames) {
     if (!s) return;
     if (s === '[DONE]') {
       trace?.exchange.record('upstream', { kind: 'sse', body: s, call: trace.call });
-      return;
+      return done;
     }
     try {
       const packet = JSON.parse(s);
       if (trace) {
         const calls = packet?.finished === true && packet.role === 'assistant' ? packet.content?.tool_calls : undefined;
-        let toolScope;
+        let toolScope, serverToolIds;
         if (clientToolNames && Array.isArray(calls) && calls.length && calls.every(call => call?.function?.name)) {
-          const clientCount = calls.filter(call => clientToolNames.has(call.function.name)).length;
-          toolScope = clientCount === calls.length ? 'client' : clientCount ? 'mixed' : 'server';
+          const serverCalls = calls.filter(call => !clientToolNames.has(call.function.name));
+          toolScope = serverCalls.length === calls.length ? 'server' : serverCalls.length ? 'mixed' : 'client';
+          serverToolIds = serverCalls.map(call => call.id).filter(id => typeof id === 'string' && id);
         }
-        const id = trace.exchange.record('upstream', { kind: 'sse', body: packet, call: trace.call, toolScope });
+        const id = trace.exchange.record('upstream', { kind: 'sse', body: packet, call: trace.call, toolScope, serverToolIds });
         if (isObject(packet) && id) packetSources.set(packet, id);
       }
       return packet;
@@ -217,6 +219,7 @@ async function* packets(stream, signal, trace, clientToolNames) {
         buffer = buffer.slice(i + 1);
         if (!line) {
           const data = parse();
+          if (data === done) return;
           if (data) yield data;
         } else if (line.startsWith('data:')) lines.push(line.slice(5).replace(/^ /, ''));
       }
@@ -313,7 +316,67 @@ const digest = (key, value) => createHmac('sha256', key).update(stableJson(value
 const inputDigest = (key, messages) => digest(key, messages.filter(message =>
   !['system', 'developer'].includes(message.role)));
 const toolResults = content => Array.isArray(content) ? content : [content];
+const savedToolContent = ({ tool_call_id, content, status, structured_content, details }) => ({
+  tool_call_id, content: content ?? null, status,
+  ...(structured_content != null && { structured_content }),
+  ...(details != null && { details })
+});
 const interrupted = error => ['incomplete_stream', 'bad_stream', 'connection_error'].includes(error?.code);
+
+function ignoredBeforeEcho(key, attempt, echo, byId, siblings) {
+  const parent = byId.get(attempt.parent);
+  const calls = parent?.role === 'assistant' && parent.content?.tool_calls;
+  if (attempt.acks.length !== 1 || attempt.acks[0] !== echo.uuid || typeof echo.content !== 'string' ||
+      digest(key, echo.content) !== attempt.content || !Array.isArray(calls)) throw recoveryPending();
+  const callIds = new Set(calls.map(call => call?.id).filter(id => typeof id === 'string' && id));
+  const ignoredIds = new Set();
+  const ignoredRows = [];
+  const seen = new Set([echo.uuid]);
+  let id = echo.parent_uuid;
+  while (id !== attempt.parent) {
+    const row = byId.get(id);
+    if (row?.role !== 'tool' || seen.has(id)) throw recoveryPending();
+    const results = toolResults(row.content);
+    if (!results.length) throw recoveryPending();
+    for (const result of results) {
+      const toolId = result?.tool_call_id;
+      if (result?.status !== 'ignored' || !callIds.has(toolId) || ignoredIds.has(toolId))
+        throw recoveryPending();
+      ignoredIds.add(toolId);
+    }
+    ignoredRows.push(row);
+    seen.add(id);
+    id = row.parent_uuid;
+  }
+  ignoredRows.reverse();
+  const observed = [...ignoredRows.map(row => row.uuid), echo.uuid];
+  if (!observed.every((uuid, index) => attempt.finalIds[index] === uuid)) throw recoveryPending();
+  const otherResults = siblings.filter(row => row.role === 'tool' && !seen.has(row.uuid));
+  const otherToolIds = new Set(otherResults.flatMap(row => toolResults(row.content).map(result => result?.tool_call_id)));
+  return { ignoredRows, ignoredIds, callIds, otherToolIds };
+}
+
+function resumesIgnoredCalls(messages, previous, attempt, reanchor) {
+  if (!previous || previous.parent !== attempt.parent || messages[0]?.role !== 'tool') return false;
+  const firstNonTool = messages.findIndex(message => message.role !== 'tool');
+  const results = firstNonTool < 0 ? messages : messages.slice(0, firstNonTool);
+  const returned = [...results.map(result => result.id), ...(previous.serverDecisions ?? []).map(item => item.tool_call_id)];
+  const ids = new Set(returned);
+  return ids.size === returned.length && returned.every(id => reanchor.callIds.has(id) && !reanchor.otherToolIds.has(id)) &&
+    [...reanchor.ignoredIds].every(id => ids.has(id));
+}
+
+function extendsIgnoredRecovery(key, input, previous, recovery) {
+  const [tool, restored] = recovery.posts;
+  if (previous.conversation !== recovery.origin.conversation || previous.parent !== recovery.origin.parent ||
+      recovery.posts.length !== 2 || tool.role !== 'tool' || !tool.ignoredToolRows?.length || restored.role !== 'user' ||
+      !recovery.posts.every(post => post.complete && post.noGenerate) || input[0]?.role !== 'tool') return false;
+  // ZCode can append a new user message to the original turn after the recovery was saved.
+  for (let i = input.length - 1; i > 0 && input[i].role === 'user'; i--) {
+    if (inputDigest(key, input.slice(0, i)) === recovery.fingerprint) return true;
+  }
+  return false;
+}
 
 function savedBranch(key, messages, attempt) {
   const byId = new Map();
@@ -335,24 +398,37 @@ function savedBranch(key, messages, attempt) {
     );
   } else {
     roots = siblings.filter(row => row.role === 'tool' && toolResults(row.content).some(
-      result => attempt.toolIds.includes(result?.tool_call_id)
+      result => attempt.toolIds.includes(result?.tool_call_id) && (result.status !== 'ignored' ||
+        !attempt.ignoredToolRows?.includes(row.uuid) || attempt.acks.includes(row.uuid))
     ));
-    const ids = roots.flatMap(row => toolResults(row.content).map(result => result?.tool_call_id));
-    if (roots.length && (ids.length !== attempt.toolIds.length || new Set(ids).size !== ids.length ||
-        !attempt.toolIds.every(id => ids.includes(id)))) throw recoveryPending();
+    if (roots.length) {
+      const results = roots.flatMap(row => toolResults(row.content));
+      const byToolId = new Map(results.map(result => [result?.tool_call_id, result]));
+      if (results.length !== attempt.toolIds.length || byToolId.size !== results.length ||
+          !attempt.toolIds.every(id => byToolId.has(id))) throw recoveryPending();
+      if (roots.some(row => !attempt.acks.includes(row.uuid))) {
+        const content = attempt.toolIds.map(id => savedToolContent(byToolId.get(id)));
+        if (digest(key, content) !== attempt.content) throw recoveryPending();
+      }
+    }
   }
   if (!roots.length) {
     if (attempt.acks.length || attempt.finalIds.length) throw recoveryPending();
     return null;
   }
-  if (roots.some(row => row?.role !== attempt.role || row.parent_uuid !== attempt.parent) ||
+  if (roots.some(row => row?.role !== attempt.role) ||
       (attempt.role === 'user' && roots.length !== 1) ||
       attempt.acks.some(id => !roots.some(row => row.uuid === id))) throw recoveryPending();
+  let reanchor;
+  if (roots.some(row => row.parent_uuid !== attempt.parent)) {
+    if (attempt.role !== 'user') throw recoveryPending();
+    reanchor = ignoredBeforeEcho(key, attempt, roots[0], byId, siblings);
+  }
   if (attempt.role === 'user' && attempt.parent !== null && !attempt.acks.length &&
       !attempt.finalIds.length && !attempt.drafts.length) throw recoveryPending();
 
-  const branch = [...roots];
-  const seen = new Set(roots.map(row => row.uuid));
+  const branch = [...(reanchor?.ignoredRows ?? []), ...roots];
+  const seen = new Set(branch.map(row => row.uuid));
   let frontier = roots;
   while (!attempt.complete && !attempt.noGenerate) {
     const next = frontier.flatMap(row => children.get(row.uuid) ?? []).filter(row => row.role !== 'user');
@@ -364,15 +440,15 @@ function savedBranch(key, messages, attempt) {
     frontier = next;
   }
   if (attempt.complete) {
-    return [...roots, ...attempt.finalIds.filter(id => !seen.has(id)).map(id => {
+    branch.push(...attempt.finalIds.filter(id => !seen.has(id)).map(id => {
       const row = byId.get(id);
       if (!row || row.role === 'user' || !seen.has(row.parent_uuid)) throw recoveryPending();
       seen.add(id);
       return row;
-    })];
+    }));
   }
   if (attempt.finalIds.some(id => !seen.has(id))) throw recoveryPending();
-  return branch;
+  return { rows: branch, reanchor };
 }
 
 const longOperationMs = 600_000;
@@ -591,17 +667,28 @@ export class Bridge {
         ? item.base.conversation === reference.conversation && item.base.parent === reference.parent
         : item.fingerprint === fingerprint);
       if (!reference && candidates.length > 1) throw recoveryPending();
-      const recovery = candidates.find(item => item.fingerprint === fingerprint) ?? candidates[0];
-      const retry = Boolean(recovery && recovery.fingerprint === fingerprint);
+      const exact = candidates.find(item => item.fingerprint === fingerprint);
+      const extensions = !exact && previous ? candidates.filter(item => extendsIgnoredRecovery(key, input, previous, item)) : [];
+      if (extensions.length > 1) throw recoveryPending();
+      const recovery = exact ?? extensions[0] ?? candidates[0];
+      const retry = Boolean(exact || extensions.length);
       const otherRecoveries = recoveries.filter(item => item !== recovery);
-      const onInterrupted = (origin, posts) => this.sessions.set(id, {
-        ...(stored ?? origin), recoveries: [...otherRecoveries, {
-          fingerprint: fingerprint ?? inputDigest(key, input), origin, posts,
-          base: recovery?.base ?? { conversation: origin.conversation, parent: reference?.parent ?? null }
-        }]
-      });
+      const recoveryFingerprint = fingerprint ?? inputDigest(key, input);
+      const onRecovery = (origin, posts) => {
+        if (!posts.length) {
+          if (stored) this.sessions.set(id, stored);
+          else this.sessions.delete(id);
+          return;
+        }
+        this.sessions.set(id, {
+          ...(stored ?? origin), recoveries: [...otherRecoveries, {
+            fingerprint: recoveryFingerprint, origin, posts: structuredClone(posts),
+            base: recovery?.base ?? { conversation: origin.conversation, parent: reference?.parent ?? null }
+          }]
+        });
+      };
       const { reply, state } = await this.generateTurn(key, {
-        ...payload, messages: input, recovery, retry, onInterrupted
+        ...payload, messages: input, recovery, retry, onRecovery
       }, previous, signal, onPart, onServerCall, onMetrics);
       if (id) {
         const [fingerprint] = transcriptFingerprints(key, [reply], fingerprints.at(-1));
@@ -673,7 +760,8 @@ export class Bridge {
 
   async generateTurn(key, payload, previous, signal, onPart, onServerCall, onMetrics) {
     signal = AbortSignal.any([signal, AbortSignal.timeout(longOperationMs)]);
-    const { recovery, retry, onInterrupted } = payload;
+    const { recovery, retry, onRecovery } = payload;
+    const matchedPrevious = previous;
     if (recovery && (retry || !previous)) previous = recovery.origin;
     let conversation = previous?.conversation;
     if (!conversation) {
@@ -691,12 +779,20 @@ export class Bridge {
     }
     payload.onConversation?.(conversation);
     return this.inConversation(conversation, signal, async () => {
+      let ignoredToolRows;
       if (recovery && !retry) {
         // Resolve the outstanding write before a different message can extend the branch.
         for (const attempt of [...recovery.posts].reverse()) {
-          const branch = await this.readSavedBranch(key, conversation, signal, attempt);
-          if (!branch) continue;
-          const last = branch.at(-1);
+          const saved = await this.readSavedBranch(key, conversation, signal, attempt);
+          if (!saved) continue;
+          if (saved.reanchor) {
+            if (recovery.posts.length !== 1 || attempt.complete || attempt.noGenerate ||
+                !resumesIgnoredCalls(payload.messages, matchedPrevious, attempt, saved.reanchor)) throw recoveryPending();
+            // The ignored results belong to the auxiliary user branch. Continue at the original tool call.
+            ignoredToolRows = saved.reanchor.ignoredRows.map(row => row.uuid);
+            break;
+          }
+          const last = saved.rows.at(-1);
           if (last.role === 'tool' || last.content?.tool_calls?.length || payload.messages[0]?.role === 'tool')
             throw recoveryPending();
           previous = { ...recovery.origin, parent: last.uuid, serverDecisions: [] };
@@ -711,14 +807,9 @@ export class Bridge {
         clientNames: [...(previous?.clientNames ?? [])]
       };
       const posts = retry ? structuredClone(recovery.posts) : [];
-      try {
-        return await this.generateInConversation(key, payload, previous, conversation, signal,
-          onPart, onServerCall, onMetrics, posts);
-      } catch (error) {
-        const sent = posts.filter(post => post.sent);
-        if (sent.length) onInterrupted?.(origin, sent);
-        throw error;
-      }
+      const trackPosts = onRecovery && (() => onRecovery(origin, posts));
+      return this.generateInConversation(key, { ...payload, trackPosts, ignoredToolRows }, previous, conversation, signal,
+        onPart, onServerCall, onMetrics, posts);
     });
   }
 
@@ -734,16 +825,18 @@ export class Bridge {
       throw recoveryUnavailable();
     }
     if (history?.uuid !== conversation || !Array.isArray(history.messages)) throw recoveryUnavailable();
-    const branch = savedBranch(key, history.messages, attempt);
-    if (source) for (const row of branch ?? []) packetSources.set(row, source);
-    return branch;
+    const saved = savedBranch(key, history.messages, attempt);
+    if (source) for (const row of saved?.rows ?? []) packetSources.set(row, source);
+    return saved;
   }
 
-  async *messagePackets(key, conversation, body, signal, posts, index, clientToolNames) {
+  async *messagePackets(key, conversation, body, signal, {
+    posts, index, clientToolNames, serverDecisions, trackPosts, ignoredToolRows
+  }) {
     const signature = digest(key, body);
     const previous = posts[index];
     const recovered = async attempt => {
-      const branch = await this.readSavedBranch(key, conversation, signal, attempt);
+      const branch = (await this.readSavedBranch(key, conversation, signal, attempt))?.rows;
       if (!branch) return null;
       const last = branch.at(-1);
       const completed = new Set(branch.map(row => row.uuid));
@@ -763,37 +856,61 @@ export class Bridge {
       });
     };
     if (previous) {
-      if (previous.signature !== signature) throw recoveryPending();
+      if (previous.role !== body.role || previous.parent !== body.parent_uuid || previous.noGenerate !== body.no_generate)
+        throw recoveryPending();
       const rows = await recovered(previous);
       if (rows) {
-        yield* rows;
+        // Older recovery records did not retain what the user POST declared as client tools.
+        if (previous.role === 'user' && previous.clientNames === undefined && previous.signature !== signature &&
+            rows.some(row => row.role === 'assistant' && row.content?.tool_calls?.length)) throw recoveryPending();
         previous.complete = true;
         previous.finalIds = rows.map(row => row.uuid);
+        trackPosts?.();
+        yield* rows;
         return;
       }
+      if (previous.signature !== signature) throw recoveryPending();
     }
 
+    signal.throwIfAborted();
+    const excluded = previous?.ignoredToolRows ?? ignoredToolRows;
     const attempt = posts[index] = {
       signature, role: body.role, parent: body.parent_uuid, noGenerate: body.no_generate,
       content: digest(key, body.content), toolIds: body.role === 'tool' ? body.content.map(item => item.tool_call_id) : [],
-      acks: [], finalIds: [], drafts: [], running: [], unreadEvent: false, sent: false, complete: false
+      acks: [], finalIds: [], drafts: [], running: [], unreadEvent: false, sent: true, complete: false,
+      ...(body.role === 'user' && { clientNames: (body.tools ?? []).map(tool => tool.name) }),
+      ...(excluded?.length && { ignoredToolRows: excluded }),
+      ...(serverDecisions?.length && { serverDecisions })
     };
+    // A crash during POST leaves an ambiguous write. Record it before entering fetch.
+    trackPosts?.();
     const drafts = new Set();
     const running = new Set();
     const finalizedAnswers = new Map();
-    let answered = false;
+    const saveProgress = () => {
+      attempt.drafts = [...drafts];
+      attempt.running = [...running];
+      trackPosts?.();
+    };
+    let answered = false, received = false;
     try {
       const response = await this.request(key, '/conversations/' + encodeURIComponent(conversation) + '/messages',
         body, signal, true);
-      attempt.sent = true;
+      received = true;
       for await (const packet of packets(response.body, signal, responseTraces.get(response), clientToolNames)) {
         if (packet.error_type || packet.error)
           throw upstreamFault(upstreamErrorStatuses.get(packet.error_type) ?? 502, packet);
         if (!packet.uuid) {
           const id = packet.content_delta?.tool_call_id;
-          if (!packet.finished && typeof id === 'string' && id) running.add(id);
+          if (!packet.finished && typeof id === 'string' && id && !running.has(id)) {
+            running.add(id);
+            saveProgress();
+          }
         } else if (!packet.finished) {
-          if (packet.content_delta && (packet.role == null || packet.role === 'assistant')) drafts.add(packet.uuid);
+          if (packet.content_delta && (packet.role == null || packet.role === 'assistant') && !drafts.has(packet.uuid)) {
+            drafts.add(packet.uuid);
+            saveProgress();
+          }
         } else {
           attempt.finalIds.push(packet.uuid);
           if (!answered && packet.role === body.role && (body.role === 'user' ||
@@ -807,18 +924,26 @@ export class Bridge {
             answered = true;
             finalizedAnswers.set(packet.uuid, digest(key, [packet.content.content || '', packet.content.tool_calls ?? []]));
           }
+          saveProgress();
         }
         yield packet;
       }
       if (drafts.size || running.size || !attempt.finalIds.length || (!body.no_generate && !answered))
         throw new Fault(502, 'incomplete_stream', 'Поток Напарника завершился до ответа.');
       attempt.complete = true;
+      saveProgress();
     } catch (error) {
+      const rejectionStatus = upstreamErrorStatuses.get(error?.code);
+      if (!received && !signal.aborted && rejectionStatus === error?.status && rejectionStatus < 500) {
+        // A documented HTTP rejection before SSE did not create this message.
+        if (previous) posts[index] = previous;
+        else posts.splice(index, 1);
+        trackPosts?.();
+        throw error;
+      }
       if (signal.aborted || interrupted(error)) {
-        attempt.sent = true;
-        attempt.drafts = [...drafts];
-        attempt.running = [...running];
         attempt.unreadEvent = error.unreadEvent === true || error.code === 'bad_stream';
+        saveProgress();
       }
       if (signal.aborted || !interrupted(error)) throw error;
       let rows;
@@ -835,19 +960,18 @@ export class Bridge {
           finalizedAnswers.get(row.uuid) !== digest(key, [row.content?.content || '', row.content?.tool_calls ?? []]))) ||
           prefix.filter(row => delivered.has(row.uuid)).some((row, position) => row.uuid !== attempt.finalIds[position]))
         throw recoveryPending();
-      yield* rows.slice(lastDelivered + 1);
       attempt.complete = true;
       attempt.finalIds = rows.map(row => row.uuid);
-    } finally {
-      if (!attempt.complete) {
-        attempt.drafts = [...drafts];
-        attempt.running = [...running];
-      }
+      drafts.clear();
+      running.clear();
+      saveProgress();
+      yield* rows.slice(lastDelivered + 1);
     }
   }
 
   async generateInConversation(
-    key, { messages, tools, publicCallId, onDraft }, previous, conversation, signal, onPart, onServerCall, onMetrics, posts
+    key, { messages, tools, publicCallId, onDraft, trackPosts, ignoredToolRows }, previous, conversation, signal,
+    onPart, onServerCall, onMetrics, posts
   ) {
     // The provider reserves tool names (including ZCode's TodoWrite). Give
     // client tools their own wire names and restore them in public responses.
@@ -862,7 +986,8 @@ export class Bridge {
       wireNames.set(wireName, tool.name);
       return { ...tool, name: wireName };
     });
-    const knownClientNames = new Set([...(previous?.clientNames ?? []), ...wireNames.keys()]);
+    const knownClientNames = new Set([...(previous?.clientNames ?? []), ...wireNames.keys(),
+      ...posts.flatMap(post => post.clientNames ?? [])]);
     let parent = previous?.parent ?? null;
     const turns = [];
     for (const msg of messages) {
@@ -879,26 +1004,33 @@ export class Bridge {
       }
     }
     if (previous?.serverDecisions?.length && turns[0]?.role === 'tool') {
-      turns[0].content.push(...previous.serverDecisions.map(({ name, ...decision }) =>
-        name && !posts.length ? toolDecision(decision.tool_call_id, this.serverToolEnabled(name)) : decision));
+      turns[0].serverDecisions = previous.serverDecisions.map(({ name, ...decision }) =>
+        name ? toolDecision(decision.tool_call_id, this.serverToolEnabled(name)) : decision);
     }
     const reviewed = new Set((previous?.serverDecisions ?? []).map((item) => item.tool_call_id));
     let serverDecisions = [];
     let lastAssistant, usage, context;
     let text = '',
       calls = [];
-    for (const [i, turn] of turns.entries()) {
+    for (const [i, { serverDecisions: proposed, ...turn }] of turns.entries()) {
       signal.throwIfAborted();
       const last = i === turns.length - 1;
-      const body = { ...turn, parent_uuid: turn.parent_uuid ?? parent, no_generate: !last };
+      const priorIgnored = !i && turn.role === 'tool' ? posts[i]?.ignoredToolRows ?? ignoredToolRows : undefined;
+      const body = { ...turn, parent_uuid: turn.parent_uuid ?? parent, no_generate: !last || Boolean(priorIgnored?.length) };
+      const decisions = proposed && (posts[i]?.serverDecisions ?? proposed);
+      if (decisions) body.content = [...turn.content, ...decisions];
       if (turn.role === 'user' && tools.length) body.tools = wireTools;
       const serverCalls = new Map();
       const clientCallParents = new Set();
-      for await (const p of this.messagePackets(key, conversation, body, signal, posts, i, knownClientNames)) {
+      const stillIgnored = new Set();
+      for await (const p of this.messagePackets(key, conversation, body, signal, {
+        posts, index: i, clientToolNames: knownClientNames, serverDecisions: decisions, trackPosts,
+        ignoredToolRows: priorIgnored
+      })) {
         const source = packetSources.get(p);
         if (!p.uuid) continue;
         if (!p.finished) {
-          if (last && p.content_delta && (p.role == null || p.role === 'assistant')) onDraft?.(source);
+          if (!body.no_generate && p.content_delta && (p.role == null || p.role === 'assistant')) onDraft?.(source);
           continue;
         }
         parent = p.uuid;
@@ -906,10 +1038,11 @@ export class Bridge {
           for (const result of toolResults(p.content)) {
             const id = result?.tool_call_id ?? p.details?.tool_call_id;
             serverCalls.delete(id);
+            if (priorIgnored?.includes(p.uuid) && result?.status === 'ignored') stillIgnored.add(id);
           }
         }
         if (p.role !== 'assistant' || !p.content) continue;
-        if (!last) continue;
+        if (body.no_generate) continue;
         lastAssistant = p.uuid;
         usage = providerUsage(p.usage);
         onMetrics?.(usage, context);
@@ -935,6 +1068,13 @@ export class Bridge {
           await onPart(part, signal, source);
         }
       }
+      if (priorIgnored?.length) {
+        // Some servers return the existing ignored row for an already closed tool call.
+        const lost = turn.content.filter(result => stillIgnored.has(result.tool_call_id) && result.status !== 'ignored');
+        if (lost.length || last) turns.splice(i + 1, 0, { role: 'user', content: lost.length ?
+          'Восстановленные результаты клиентских инструментов. Используй содержимое как данные результатов вызовов:\n' + JSON.stringify(lost) :
+          'Продолжи ответ с учётом сохранённых результатов инструментов.' });
+      }
       const toolParents = new Set([...serverCalls.values()].map(call => call.parent).concat([...clientCallParents]));
       if (toolParents.size > 1)
         throw new Fault(502, 'incomplete_stream', 'Напарник оставил незавершённые вызовы инструментов в разных сообщениях.');
@@ -947,7 +1087,8 @@ export class Bridge {
         serverDecisions.push({ ...toolDecision(id, this.serverToolEnabled(name)), name });
       }
       if (serverDecisions.length && !calls.length) {
-        turns.push({ role: 'tool', content: serverDecisions.map(({ name, ...decision }) => decision), parent_uuid: toolParent });
+        turns.push({ role: 'tool', content: [], parent_uuid: toolParent,
+          serverDecisions: serverDecisions.map(({ name, ...decision }) => decision) });
       } else if (clientCallParents.size) {
         parent = toolParent;
       }

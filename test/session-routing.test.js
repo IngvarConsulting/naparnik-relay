@@ -107,7 +107,10 @@ test('После перезапуска результат инструмент�
   assert.ok(!readFileSync(file, 'utf8').includes(input.messages[0].content));
   const failed = service(key, () => { throw new Error('Поток оборвался'); });
   await assert.rejects(run(failed, input), /Поток оборвался/);
-  assert.deepEqual(new SessionBindings(profile, key).get(id), saved);
+  const { recoveries, ...cursor } = new SessionBindings(profile, key).get(id);
+  assert.deepEqual(cursor, saved);
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0].posts[0].parent, saved.parent);
 });
 
 test('Запрос названия может прийти раньше чата и не сдвигает его курсор', async () => {

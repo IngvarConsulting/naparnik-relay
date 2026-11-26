@@ -106,7 +106,8 @@ export class TraceStore {
     secrets = [...new Set(secrets.filter(value => typeof value === 'string' && value.length))].sort((a, b) => b.length - a.length);
     const safe = value => redactText(String(value ?? ''), secrets).slice(0, 1024);
     const time = date();
-    const sessionKey = safe(sessionId) || randomUUID();
+    const namedSession = safe(sessionId);
+    const sessionKey = namedSession || randomUUID();
     const session = this.#sessions.get(sessionKey) ?? { id: sessionKey, title: '', protocol: '', updated: time, exchanges: new Set() };
     session.title ||= safe(title).slice(0, 110);
     session.protocol = safe(protocol) || session.protocol;
@@ -124,6 +125,7 @@ export class TraceStore {
       for (const key of ['method', 'path', 'status', 'call', 'source', 'event', 'toolScope']) {
         if (data[key] != null) packet[key] = typeof data[key] === 'number' ? data[key] : safe(data[key]);
       }
+      if (Array.isArray(data.serverToolIds) && data.serverToolIds.length) packet.serverToolIds = data.serverToolIds.map(safe);
       if (data.body !== undefined) Object.assign(packet, cleanBody(data.body, secrets, this.limits.maxPacketBytes));
       if (data.truncated) packet.truncated = true;
       if (!packet.truncated) delete packet.truncated;
@@ -144,12 +146,37 @@ export class TraceStore {
       return packet.id;
     };
 
-    const rename = value => { if (value && this.#exchanges.has(entry.id)) session.title = safe(value).slice(0, 110); };
+    const rename = value => {
+      if (value && this.#exchanges.has(entry.id)) entry.session.title = safe(value).slice(0, 110);
+    };
+    const conversation = value => {
+      if (!value || entry.conversation || !this.#exchanges.has(entry.id)) return;
+      const id = entry.conversation = safe(value).toLowerCase();
+      if (namedSession) return;
+
+      const provisional = entry.session;
+      const target = [...this.#sessions.values()].find(session =>
+        session.protocol === provisional.protocol && session.conversation === id);
+      if (!target) {
+        provisional.conversation = id;
+        return;
+      }
+      provisional.exchanges.delete(entry.id);
+      if (!provisional.exchanges.size) this.#sessions.delete(provisional.id);
+      entry.session = target;
+      target.exchanges.add(entry.id);
+      target.title ||= provisional.title;
+      if (provisional.updated > target.updated) target.updated = provisional.updated;
+      this.#sessions.delete(target.id);
+      this.#sessions.set(target.id, target);
+      this.#prune(target);
+    };
     return {
       id: entry.id,
-      sessionId: session.id,
+      get sessionId() { return entry.session.id; },
       record,
-      initialTitle: value => { if (!session.title) rename(value); },
+      conversation,
+      initialTitle: value => { if (!entry.session.title) rename(value); },
       rename
     };
   }
@@ -185,11 +212,9 @@ export class TraceStore {
   snapshot(sessionId) {
     const sessions = [...this.#sessions.values()].map(({ id, title, protocol, updated, exchanges }) =>
       ({ id, title, protocol, updated, count: exchanges.size })).sort((a, b) => b.updated.localeCompare(a.updated));
-    const ids = this.#sessions.get(sessionId)?.exchanges ?? [];
-    const exchanges = [...ids].map(id => {
-      const { time, client, upstream } = this.#exchanges.get(id);
-      return { id, time, client, upstream };
-    });
+    const exchanges = [...this.#exchanges.values()]
+      .filter(entry => entry.session.id === sessionId)
+      .map(({ id, time, client, upstream, conversation }) => ({ id, time, client, upstream, conversation }));
     return structuredClone({ sessions, exchanges });
   }
 

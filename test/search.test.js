@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Bridge } from '../bridge.js';
 
 const search = 'mcp__knowledge-hub__Search_ITS';
@@ -30,12 +31,36 @@ function service(rounds, history = []) {
     posts.push(body);
     const events = rounds.shift();
     assert.ok(events, 'unexpected additional request');
+    if (events instanceof Response) return events;
     return new Response(typeof events === 'string' ? events : events.map(event).join(''));
   };
   return { bridge, posts };
 }
 const run = (bridge, body = query, controller = new AbortController(), part = () => {}, onServerCall) =>
   bridge.generate('fixture', { ...body, protocol: 'OpenAI', sessionId: 'search' }, controller.signal, part, onServerCall);
+
+test('Терминатор SSE завершает готовый ответ при открытом HTTP-потоке', async () => {
+  let source, cancelled = false;
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      source = controller;
+      controller.enqueue(new TextEncoder().encode(event(answer('final', 'Готово.', [])) + 'data: [DONE]\n\n'));
+    },
+    cancel() { cancelled = true; }
+  }));
+  const { bridge } = service([response]);
+  const responsePromise = run(bridge);
+  const timer = new AbortController();
+  try {
+    const result = await Promise.race([responsePromise, delay(500, null, { signal: timer.signal })]);
+    assert.equal(result?.content, 'Готово.');
+    assert.equal(cancelled, true);
+  } finally {
+    timer.abort();
+    if (!cancelled) source.close();
+    await responsePromise.catch(() => {});
+  }
+});
 
 test('Поиск ИТС: групповые и повторные запросы остаются в одном диалоге', async () => {
   const { bridge, posts } = service([

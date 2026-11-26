@@ -25,14 +25,15 @@ export function save(value, create = false) {
   writePrivateJSON(file, value, create);
 }
 
+const isServerDecision = item => typeof item?.tool_call_id === 'string' &&
+  ['accepted', 'rejected'].includes(item.status) && item.content === null &&
+  (item.name === undefined || typeof item.name === 'string');
+
 function isCursor(value, allowRoot = false) {
   return typeof value?.conversation === 'string' && value.conversation &&
     ((typeof value.parent === 'string' && value.parent) || (allowRoot && value.parent === null)) &&
     Array.isArray(value.clientNames) && value.clientNames.every(name => typeof name === 'string') &&
-    Array.isArray(value.serverDecisions) && value.serverDecisions.every(
-      item => typeof item?.tool_call_id === 'string' && ['accepted', 'rejected'].includes(item.status) &&
-        item.content === null && (item.name === undefined || typeof item.name === 'string')
-    );
+    Array.isArray(value.serverDecisions) && value.serverDecisions.every(isServerDecision);
 }
 
 const isDigest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
@@ -46,7 +47,13 @@ function isRecovery(value) {
       ['user', 'tool'].includes(post.role) && (post.parent === null || typeof post.parent === 'string') &&
       isDigest(post.signature) && isDigest(post.content) &&
       ['toolIds', 'acks', 'finalIds', 'drafts', 'running'].every(field =>
-        Array.isArray(post[field]) && post[field].every(item => typeof item === 'string')));
+        Array.isArray(post[field]) && post[field].every(item => typeof item === 'string')) &&
+      (post.clientNames === undefined || post.role === 'user' &&
+        Array.isArray(post.clientNames) && post.clientNames.every(name => typeof name === 'string')) &&
+      (post.ignoredToolRows === undefined || post.role === 'tool' &&
+        Array.isArray(post.ignoredToolRows) && post.ignoredToolRows.every(id => typeof id === 'string' && id)) &&
+      (post.serverDecisions === undefined || Array.isArray(post.serverDecisions) &&
+        post.serverDecisions.every(item => isServerDecision(item) && post.toolIds.includes(item.tool_call_id))));
 }
 
 export class SessionBindings {
@@ -79,6 +86,14 @@ export class SessionBindings {
   set(id, { conversation, parent, clientNames, serverDecisions, checkpoints, recoveries }) {
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     writePrivateJSON(this.path(id), { conversation, parent, clientNames: [...clientNames], serverDecisions, checkpoints, recoveries });
+  }
+
+  delete(id) {
+    try {
+      unlinkSync(this.path(id));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
   }
 }
 
