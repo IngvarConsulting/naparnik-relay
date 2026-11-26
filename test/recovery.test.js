@@ -401,6 +401,62 @@ test('Новое сообщение после восстановления igno
   assert.equal(service.posts.at(-1).content, request.at(-1).content + '\n\n' + extra.content);
 });
 
+test('Дополнение после обрыва проходит от сохранённого вопроса и переживает повторный обрыв', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'relay-appended-recovery-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const service = fixture();
+  const bindings = () => new SessionBindings(dir, key);
+  const tools = [{ name: 'lookup' }];
+  const calls = ids => ({ tool_calls: ids.map(id => ({ id, function: { name: 'client_lookup', arguments: '{}' } })) });
+  const question = user('Первый вопрос');
+  const first = message('first', null, 'user', question.content);
+  const lookup = message('calls', first.uuid, 'assistant', calls(['a', 'b']));
+  service.responses.push(sse(echo(first.uuid, null), { ...lookup, finished: true }));
+  const prior = await service.connect(bindings(), { tools })([question]);
+  const result = id => ({ role: 'tool', id, status: 'ok', content: 'Результат ' + id });
+  const saved = (id, parent, toolId) => message(id, parent, 'tool', {
+    tool_call_id: toolId, status: 'ok', content: result(toolId).content
+  });
+  const a = saved('saved-a', lookup.uuid, 'a');
+  const b = saved('saved-b', a.uuid, 'b');
+  const oldInput = [question, prior, result('a'), result('b'), user('Сохранённый вопрос')];
+  const oldUser = message('old-user', b.uuid, 'user', 'Сервер сохранил нормализованный текст');
+  const undelivered = message('old-answer', oldUser.uuid, 'assistant', calls(['c']));
+  const cancel = new AbortController();
+  service.responses.push(sse({ ...a, finished: true }, { ...b, finished: true }),
+    sse(echo(oldUser.uuid, b.uuid), draft(undelivered.uuid)));
+  await assert.rejects(service.connect(bindings(), { tools, onDraft: () => cancel.abort() })(oldInput, () => {}, cancel.signal));
+  const history = [first, lookup, a, b, oldUser, undelivered];
+  service.setHistory(history);
+
+  const extra = user('Новое уточнение');
+  const input = [...oldInput, extra];
+  const id = JSON.stringify(['OpenAI', 'recovery']);
+  const state = bindings().get(id);
+  const delivered = structuredClone(state);
+  delivered.recoveries[0].posts[1].finalIds.push(undelivered.uuid);
+  bindings().set(id, delivered);
+  await assert.rejects(service.connect(bindings(), { tools })(input), { code: 'recovery_pending' });
+  assert.equal(service.posts.length, 3);
+  bindings().set(id, state);
+
+  const newUser = message('new-user', oldUser.uuid, 'user', extra.content);
+  const answer = reply('new-answer', newUser.uuid, 'Итоговый ответ');
+  const abortAgain = new AbortController();
+  service.responses.push(sse(echo(newUser.uuid, oldUser.uuid), draft(answer.uuid)));
+  await assert.rejects(service.connect(bindings(), { tools, onDraft: () => abortAgain.abort() })(input, () => {}, abortAgain.signal),
+    { code: 'incomplete_stream' });
+  assert.equal(abortAgain.signal.aborted, true);
+  assert.deepEqual(service.posts.map(post => [post.role, post.parent_uuid]), [
+    ['user', null], ['tool', lookup.uuid], ['user', b.uuid], ['user', oldUser.uuid]
+  ]);
+  assert.equal(service.posts.at(-1).content, extra.content);
+
+  service.setHistory([...history, newUser, answer]);
+  assert.equal((await service.connect(bindings(), { tools })(input)).content, answer.content.content);
+  assert.equal(service.posts.length, 4);
+});
+
 test('Новое сообщение продолжает сохранённый вопрос без ответа', async () => {
   const service = fixture();
   const ask = service.connect();

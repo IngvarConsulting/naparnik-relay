@@ -371,11 +371,14 @@ function extendsIgnoredRecovery(key, input, previous, recovery) {
   if (previous.conversation !== recovery.origin.conversation || previous.parent !== recovery.origin.parent ||
       recovery.posts.length !== 2 || tool.role !== 'tool' || !tool.ignoredToolRows?.length || restored.role !== 'user' ||
       !recovery.posts.every(post => post.complete && post.noGenerate) || input[0]?.role !== 'tool') return false;
-  // ZCode can append a new user message to the original turn after the recovery was saved.
+  return appendedUserPrefix(key, input, recovery.fingerprint) > 0;
+}
+
+function appendedUserPrefix(key, input, fingerprint) {
   for (let i = input.length - 1; i > 0 && input[i].role === 'user'; i--) {
-    if (inputDigest(key, input.slice(0, i)) === recovery.fingerprint) return true;
+    if (inputDigest(key, input.slice(0, i)) === fingerprint) return i;
   }
-  return false;
+  return 0;
 }
 
 function savedBranch(key, messages, attempt) {
@@ -397,10 +400,16 @@ function savedBranch(key, messages, attempt) {
       row => row.role === 'user' && typeof row.content === 'string' && digest(key, row.content) === attempt.content
     );
   } else {
-    roots = siblings.filter(row => row.role === 'tool' && toolResults(row.content).some(
+    const isResult = row => row.role === 'tool' && toolResults(row.content).some(
       result => attempt.toolIds.includes(result?.tool_call_id) && (result.status !== 'ignored' ||
         !attempt.ignoredToolRows?.includes(row.uuid) || attempt.acks.includes(row.uuid))
-    ));
+    );
+    roots = siblings.filter(isResult);
+    // 1C can chain individual results from one POST rather than store them as siblings.
+    for (let i = 0; i < roots.length; i++) {
+      if (roots.length > attempt.toolIds.length) throw recoveryPending();
+      roots.push(...(children.get(roots[i].uuid) ?? []).filter(isResult));
+    }
     if (roots.length) {
       const results = roots.flatMap(row => toolResults(row.content));
       const byToolId = new Map(results.map(result => [result?.tool_call_id, result]));
@@ -409,6 +418,9 @@ function savedBranch(key, messages, attempt) {
       if (roots.some(row => !attempt.acks.includes(row.uuid))) {
         const content = attempt.toolIds.map(id => savedToolContent(byToolId.get(id)));
         if (digest(key, content) !== attempt.content) throw recoveryPending();
+      } else {
+        const order = new Map(attempt.acks.map((id, index) => [id, index]));
+        roots.sort((a, b) => order.get(a.uuid) - order.get(b.uuid));
       }
     }
   }
@@ -420,8 +432,7 @@ function savedBranch(key, messages, attempt) {
       (attempt.role === 'user' && roots.length !== 1) ||
       attempt.acks.some(id => !roots.some(row => row.uuid === id))) throw recoveryPending();
   let reanchor;
-  if (roots.some(row => row.parent_uuid !== attempt.parent)) {
-    if (attempt.role !== 'user') throw recoveryPending();
+  if (attempt.role === 'user' && roots[0].parent_uuid !== attempt.parent) {
     reanchor = ignoredBeforeEcho(key, attempt, roots[0], byId, siblings);
   }
   if (attempt.role === 'user' && attempt.parent !== null && !attempt.acks.length &&
@@ -429,7 +440,7 @@ function savedBranch(key, messages, attempt) {
 
   const branch = [...(reanchor?.ignoredRows ?? []), ...roots];
   const seen = new Set(branch.map(row => row.uuid));
-  let frontier = roots;
+  let frontier = roots.filter(row => !(children.get(row.uuid) ?? []).some(child => seen.has(child.uuid)));
   while (!attempt.complete && !attempt.noGenerate) {
     const next = frontier.flatMap(row => children.get(row.uuid) ?? []).filter(row => row.role !== 'user');
     if (!next.length) break;
@@ -674,7 +685,7 @@ export class Bridge {
       const retry = Boolean(exact || extensions.length);
       const otherRecoveries = recoveries.filter(item => item !== recovery);
       const recoveryFingerprint = fingerprint ?? inputDigest(key, input);
-      const onRecovery = (origin, posts) => {
+      const onRecovery = (origin, posts, consumedPrefix) => {
         if (!posts.length) {
           if (stored) this.sessions.set(id, stored);
           else this.sessions.delete(id);
@@ -683,7 +694,8 @@ export class Bridge {
         this.sessions.set(id, {
           ...(stored ?? origin), recoveries: [...otherRecoveries, {
             fingerprint: recoveryFingerprint, origin, posts: structuredClone(posts),
-            base: recovery?.base ?? { conversation: origin.conversation, parent: reference?.parent ?? null }
+            base: recovery?.base ?? { conversation: origin.conversation, parent: reference?.parent ?? null },
+            ...(consumedPrefix && { consumedPrefix })
           }]
         });
       };
@@ -780,6 +792,12 @@ export class Bridge {
     payload.onConversation?.(conversation);
     return this.inConversation(conversation, signal, async () => {
       let ignoredToolRows;
+      let consumedPrefix = retry ? recovery.consumedPrefix : undefined;
+      if (consumedPrefix) {
+        const prefix = appendedUserPrefix(key, payload.messages, consumedPrefix);
+        if (!prefix) throw recoveryPending();
+        payload = { ...payload, messages: payload.messages.slice(prefix) };
+      }
       if (recovery && !retry) {
         // Resolve the outstanding write before a different message can extend the branch.
         for (const attempt of [...recovery.posts].reverse()) {
@@ -793,6 +811,14 @@ export class Bridge {
             break;
           }
           const last = saved.rows.at(-1);
+          const appended = matchedPrevious && appendedUserPrefix(key, payload.messages, recovery.fingerprint);
+          if (appended && attempt === recovery.posts.at(-1) && attempt.role === 'user' && !attempt.noGenerate) {
+            const parent = await this.recoverAppendedParent(key, conversation, recovery, saved.rows, signal);
+            previous = { ...recovery.origin, parent, serverDecisions: [] };
+            consumedPrefix = recovery.fingerprint;
+            payload = { ...payload, messages: payload.messages.slice(appended) };
+            break;
+          }
           if (last.role === 'tool' || last.content?.tool_calls?.length || payload.messages[0]?.role === 'tool')
             throw recoveryPending();
           previous = { ...recovery.origin, parent: last.uuid, serverDecisions: [] };
@@ -807,10 +833,33 @@ export class Bridge {
         clientNames: [...(previous?.clientNames ?? [])]
       };
       const posts = retry ? structuredClone(recovery.posts) : [];
-      const trackPosts = onRecovery && (() => onRecovery(origin, posts));
+      const trackPosts = onRecovery && (() => onRecovery(origin, posts, consumedPrefix));
       return this.generateInConversation(key, { ...payload, trackPosts, ignoredToolRows }, previous, conversation, signal,
         onPart, onServerCall, onMetrics, posts);
     });
+  }
+
+  async recoverAppendedParent(key, conversation, recovery, rows, signal) {
+    const attempt = recovery.posts.at(-1);
+    const echo = rows[0];
+    if (attempt.acks.length !== 1 || echo.uuid !== attempt.acks[0] || echo.parent_uuid !== attempt.parent)
+      throw recoveryPending();
+    let parent = recovery.origin.parent;
+    for (const post of recovery.posts.slice(0, -1)) {
+      if (!post.complete || !post.noGenerate || post.parent !== parent) throw recoveryPending();
+      const earlier = await this.readSavedBranch(key, conversation, signal, post);
+      if (!earlier || earlier.reanchor) throw recoveryPending();
+      parent = earlier.rows.at(-1).uuid;
+    }
+    if (parent !== attempt.parent) throw recoveryPending();
+
+    const last = rows.at(-1);
+    if (last.role !== 'user' && last.role !== 'assistant') throw recoveryPending();
+    if (!last.content?.tool_calls?.length) return last.uuid;
+    // The old turn's tool call never reached the client. Fork from the confirmed user message.
+    if (last.parent_uuid !== echo.uuid || !attempt.drafts.includes(last.uuid) || attempt.unreadEvent ||
+        attempt.running.length || attempt.finalIds.some(id => id !== echo.uuid)) throw recoveryPending();
+    return echo.uuid;
   }
 
   async readSavedBranch(key, conversation, signal, attempt) {

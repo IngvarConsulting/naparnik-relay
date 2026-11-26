@@ -39,6 +39,7 @@ function isCursor(value, allowRoot = false) {
 const isDigest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 function isRecovery(value) {
   return isDigest(value?.fingerprint) && isCursor(value.origin, true) &&
+    (value.consumedPrefix === undefined || isDigest(value.consumedPrefix)) &&
     value.base?.conversation === value.origin.conversation &&
     (value.base.parent === null || typeof value.base.parent === 'string') &&
     Array.isArray(value.posts) && value.posts.length > 0 && value.posts.every(post =>
