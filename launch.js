@@ -4,17 +4,21 @@ import { load, origin } from './state.js';
 
 async function running() {
   try {
-    return (
-      (await (await fetch(origin + '/health', { signal: AbortSignal.timeout(600) })).json()).service ===
-      'naparnik-relay'
-    );
+    const response = await fetch(origin + '/health', { signal: AbortSignal.timeout(600) });
+    const health = await response.json();
+    return response.ok && health.service === 'naparnik-relay' ? health : null;
   } catch {
-    return false;
+    return null;
   }
 }
 const state = load();
 if (process.argv.includes('--stop')) {
-  if (await running()) {
+  const health = await running();
+  if (health?.mode === 'desktop') {
+    console.error('Завершите настольный Напарник через меню значка в трее.');
+    process.exit(1);
+  }
+  if (health) {
     const headers = { 'Content-Type': 'application/json', 'X-Relay-Panel': '1' };
     const auth = await fetch(origin + '/panel/session', {
       method: 'POST',

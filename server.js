@@ -2,7 +2,7 @@ import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { Bridge, Fault, MODEL, defaultConversationSettings, normalize, requireInput } from './bridge.js';
+import { Bridge, Fault, MODEL, defaultConversationSettings, normalize, requireInput, sessionBusy } from './bridge.js';
 import { completion } from './formats.js';
 import { join } from 'node:path';
 import { SessionTitles } from './session-titles.js';
@@ -19,6 +19,7 @@ const assets = new Map([
   ['/tools.js', ['tools.js', 'text/javascript']],
   ['/trace.html', ['trace.html', 'text/html']],
   ['/trace.js', ['trace.js', 'text/javascript']],
+  ['/trace-links.js', ['trace-links.js', 'text/javascript']],
   ['/trace-scroll.js', ['trace-scroll.js', 'text/javascript']],
   ['/trace-syntax.js', ['trace-syntax.js', 'text/javascript']],
   ['/style.css', ['style.css', 'text/css']],
@@ -46,9 +47,14 @@ const anthropicErrorTypes = new Map([
   [403, 'permission_error'], [404, 'not_found_error'], [409, 'conflict_error'],
   [413, 'request_too_large'], [429, 'rate_limit_error'], [529, 'overloaded_error']
 ]);
+const uuid = '[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}';
+const compactRoute = new RegExp('^/v1/conversations/(' + uuid + ')/compact$');
+const deleteConversationRoute = new RegExp('^/v1/conversations/(' + uuid + ')$');
 
-function conversationSettings(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3) return;
+function conversationSettings(value, defaults) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) return;
+  if (defaults) value = { ...defaults, ...value };
+  if (Object.keys(value).length !== 3) return;
   const { ui_language, programming_language, script_language } = value;
   if (!['ru', 'en'].includes(ui_language) || !['ru', 'en'].includes(script_language) ||
       typeof programming_language !== 'string') return;
@@ -57,7 +63,8 @@ function conversationSettings(value) {
   return { ui_language, programming_language: language, script_language };
 }
 
-export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor(), profileDir = dir } = {}) {
+export function createServer({ connection = load(), upstream, persist = save, monitor = new ToolMonitor(), profileDir = dir,
+  mode = 'standalone' } = {}) {
   const sessionTitles = new SessionTitles();
   const conversationQueue = new Map();
   const traces = new TraceStore();
@@ -69,6 +76,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
   let key = connection.upstream,
     bridge = newBridge(key),
     busy = false,
+    deleting,
     revision = 0,
     accountLifetime = new AbortController();
   let limits = null,
@@ -109,17 +117,15 @@ export function createServer({ connection = load(), upstream, persist = save, mo
         const value = await bridge.budget(key);
         if (revision === generation) {
           limits = value;
-          checked = new Date();
           problem = null;
         }
       } catch (e) {
-        if (revision === generation) {
-          problem = authProblem(e);
-          limits = null;
-          checked = new Date();
-        }
+        if (revision === generation) problem = authProblem(e);
       } finally {
-        if (revision === generation) refresh = null;
+        if (revision === generation) {
+          checked = new Date();
+          refresh = null;
+        }
       }
     })();
     return refresh;
@@ -140,8 +146,8 @@ export function createServer({ connection = load(), upstream, persist = save, mo
   const server = http.createServer(async (req, res) => {
     const path = req.url?.split('?')[0],
       method = req.method;
-    const nativeCompact = method === 'POST' &&
-      path?.match(/^\/v1\/conversations\/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\/compact$/);
+    const nativeCompact = method === 'POST' && path?.match(compactRoute);
+    const nativeDelete = method === 'DELETE' && path?.match(deleteConversationRoute);
     const models = path === '/v1/models' || path?.startsWith('/v1/models/');
     const anthropic = path === '/v1/messages' || path === '/v1/messages/count_tokens' ||
       (models && typeof req.headers['anthropic-version'] === 'string');
@@ -171,7 +177,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
         res.end(data);
         return;
       }
-      if (path === '/health' && method === 'GET') return send({ service: 'naparnik-relay', ready: true });
+      if (path === '/health' && method === 'GET') return send({ service: 'naparnik-relay', ready: true, mode });
       if (path.startsWith('/panel/')) {
         if (req.headers['x-relay-panel'] !== '1')
           throw new Fault(403, 'forbidden', 'Откройте панель через программу запуска.');
@@ -186,6 +192,8 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             'Откройте панель через «Запустить Напарник.command» или npm start.'
           );
         if (path === '/panel/stop' && method === 'POST') {
+          if (mode === 'desktop')
+            throw new Fault(409, 'desktop_service', 'Завершите настольный Напарник через меню значка в трее.');
           send({ stopping: true });
           server.close();
           return;
@@ -204,8 +212,9 @@ export function createServer({ connection = load(), upstream, persist = save, mo
         }
         if (path === '/panel/conversation-defaults') {
           if (method === 'GET') return send(conversationDefaults());
-          if (method === 'PUT') {
-            const input = conversationSettings(await body(req));
+          if (method === 'PUT' || method === 'PATCH') {
+            const value = await body(req);
+            const input = conversationSettings(value, method === 'PATCH' ? conversationDefaults() : undefined);
             requireInput(input, 'Выберите русский или английский язык и укажите код языка программирования.');
             const next = { ...connection, conversationDefaults: input };
             persist(next);
@@ -224,6 +233,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           return send(status());
         }
         if (path === '/panel/account' && ['POST', 'DELETE'].includes(method)) {
+          if (deleting) throw sessionBusy();
           if (busy) throw new Fault(409, 'busy', 'Изменение подключения уже выполняется.');
           busy = true;
           try {
@@ -260,6 +270,32 @@ export function createServer({ connection = load(), upstream, persist = save, mo
         if (typeof localKey !== 'string' || !localKey ||
             (req.headers.authorization !== 'Bearer ' + localKey && req.headers['x-api-key'] !== localKey))
           throw new Fault(401, 'authentication_error', 'Скопируйте локальный API key из панели.');
+        if (nativeDelete) {
+          if (!key) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
+          if (busy) throw sessionBusy();
+          const conversation = nativeDelete[1].toLowerCase();
+          // The tool journal retains raw client IDs even after the in-memory trace has expired.
+          const sessionIds = new Set(monitor.records.sessions.map(({ protocol, id }) => JSON.stringify([protocol, id])));
+          const sessionId = req.headers['x-session-id']?.trim();
+          const harnessId = req.headers['x-deepseek-harness-session-id']?.trim();
+          if (sessionId) {
+            for (const protocol of ['OpenAI', 'Anthropic']) sessionIds.add(JSON.stringify([protocol, sessionId]));
+          }
+          if (harnessId) sessionIds.add(JSON.stringify(['Anthropic', harnessId]));
+          const bindings = bridge.bindingsAfterDeletion(conversation, sessionIds);
+          busy = true;
+          deleting = { conversation, bindings };
+          try {
+            await bridge.deleteConversation(key, conversation, bindings);
+            traces.deleteConversation(conversation);
+            traceConversations.delete(conversation);
+            if (!res.destroyed) send({ id: conversation, object: 'conversation.deleted', deleted: true });
+          } finally {
+            deleting = undefined;
+            busy = false;
+          }
+          return;
+        }
         if (nativeCompact) {
           const credential = key, activeBridge = bridge;
           if (!credential) throw new Fault(503, 'account_required', 'Подключите 1С:Напарник в панели шлюза.');
@@ -270,6 +306,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           });
           const input = await body(req, true);
           const conversation = nativeCompact[1].toLowerCase();
+          if (deleting?.conversation === conversation) throw sessionBusy();
           const linked = traceConversations.get(conversation);
           trace = beginTrace(linked?.protocol ?? '1С', linked?.id ?? conversation, 'Компактизация');
           trace.requestId = trace.record('client', { kind: 'request', method, path, body: input });
@@ -309,6 +346,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           const sessionId = querySource && querySource !== 'main_turn'
             ? undefined : harnessId || req.headers['x-session-id']?.trim();
           const traceSessionId = sessionId ? JSON.stringify([protocol, sessionId]) : undefined;
+          if (deleting?.bindings.has(traceSessionId)) throw sessionBusy();
           trace = beginTrace(protocol, traceSessionId);
           trace.requestId = trace.record('client', { kind: 'request', method, path, body: input });
           const payload = normalize(input, anthropic, harnessId);
@@ -323,7 +361,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             : !anthropic && (querySource || req.headers['x-zcode-session-type']) ? 'ZCode' : undefined;
           const session = monitor.observe(protocol, declared, sessionId, agent);
           const stream = input.stream === true;
-          const format = completion(res, anthropic, stream, input.stream_options?.include_usage === true, trace);
+          const format = completion(res, anthropic, stream, input.stream_options?.include_usage === true, trace, key);
           const abort = new AbortController();
           res.on('close', () => {
             if (!res.writableEnded) {
@@ -338,6 +376,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             const signal = AbortSignal.any([abort.signal, accountLifetime.signal]);
             const answer = await runTrace(trace, () => bridge.generate(key, {
               ...payload, protocol, sessionId, conversationDefaults: conversationDefaults(),
+              completeHistory: !harnessId && querySource !== 'main_turn' && req.headers['x-relay-input'] !== 'delta',
               onDraft: stream ? format.waiting : undefined,
               onConversation: id => {
                 res.setHeader('X-Relay-Conversation-Id', id);
@@ -359,7 +398,6 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             outcome = abort.signal.aborted ? 'Отменён' : e.message;
             if (generation === revision && [401, 402, 403, 503].includes(e.status)) {
               problem = authProblem(e);
-              checked = new Date();
             }
             throw e;
           } finally {

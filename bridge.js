@@ -81,8 +81,10 @@ const titleInputPrefix = 'Generate the session title from this JSON array of hum
 const titleUpdatePrefix = 'Update the session title from this JSON object:\n';
 
 function isHarnessTitleRequest(body, sessionId) {
-  if (!sessionId || typeof body.system !== 'string' ||
-      !body.system.startsWith(titleInstruction) || body.tools?.length ||
+  const system = Array.isArray(body.system) && body.system.length === 1 && body.system[0]?.type === 'text'
+    ? body.system[0].text : body.system;
+  if (!sessionId || typeof system !== 'string' ||
+      !system.startsWith(titleInstruction) || body.tools?.length ||
       body.messages.length !== 1 || body.messages[0].role !== 'user') return false;
   const content = body.messages[0].content;
   const text = typeof content === 'string' ? content :
@@ -292,8 +294,10 @@ function transcriptFingerprints(key, messages, seed = '') {
     let normalized = message;
     if (message.role === 'tool') {
       normalized = { role: message.role, id: message.id, content: message.content ?? '' };
-    } else if (message.role === 'assistant' && message.calls?.length) {
-      normalized = { ...message, calls: message.calls.map(call => ({ ...call, args: canonicalArguments(call.args) })) };
+    } else if (message.role === 'assistant') {
+      const { reasoning, ...history } = message;
+      normalized = history;
+      if (history.calls?.length) normalized.calls = history.calls.map(call => ({ ...call, args: canonicalArguments(call.args) }));
     }
     seed = createHmac('sha256', key).update(seed).update(stableJson(normalized)).digest('hex');
     return seed;
@@ -313,6 +317,8 @@ const recoveryPending = () => new Fault(409, 'recovery_pending',
 const recoveryUnavailable = () => new Fault(503, 'recovery_unavailable',
   'Не удалось сверить сообщение с историей Напарника. Повторите запрос позже.');
 const digest = (key, value) => createHmac('sha256', key).update(stableJson(value)).digest('hex');
+const confirmedReasoning = content => typeof content?.reasoning_content === 'string' ? content.reasoning_content : '';
+const assistantDigest = (key, content) => digest(key, [content?.content || '', content?.tool_calls ?? [], confirmedReasoning(content)]);
 const inputDigest = (key, messages) => digest(key, messages.filter(message =>
   !['system', 'developer'].includes(message.role)));
 const toolResults = content => Array.isArray(content) ? content : [content];
@@ -464,9 +470,12 @@ function savedBranch(key, messages, attempt) {
 
 const longOperationMs = 600_000;
 const maxCheckpoints = 128;
+const maxTranscriptCheckpoints = 1024;
 const maxToolCallbacks = 128;
 const relayToolPrefix = 'call_relay_';
+const transcriptKey = (protocol, fingerprint) => JSON.stringify([protocol, fingerprint]);
 const noTitleContext = () => new Fault(424, 'insufficient_context', 'Для названия нужен ответ в этом диалоге.');
+export const sessionBusy = () => new Fault(409, 'session_busy', 'Дождитесь завершения текущей операции в диалоге.');
 
 export class Bridge {
   constructor(base = 'https://code.1c.ai/public/v1', sessions = new Map(), conversationQueue = new Map(),
@@ -475,6 +484,7 @@ export class Bridge {
     this.sessions = sessions;
     this.pending = new Map();
     this.conversationQueue = conversationQueue;
+    this.deletingConversations = new Set();
     this.serverToolEnabled = serverToolEnabled;
     this.toolCallbacks = new Map();
     this.sessionEvents = new EventEmitter().setMaxListeners(0);
@@ -537,6 +547,7 @@ export class Bridge {
   }
   async inConversation(conversation, signal, run) {
     const id = conversation.toLowerCase();
+    if (this.deletingConversations.has(id)) throw sessionBusy();
     const operation = (this.conversationQueue.get(id) ?? Promise.resolve()).then(() => {
       signal.throwIfAborted();
       return run();
@@ -547,6 +558,53 @@ export class Bridge {
       return await operation;
     } finally {
       if (this.conversationQueue.get(id) === settled) this.conversationQueue.delete(id);
+    }
+  }
+
+  bindingsAfterDeletion(conversation, sessionIds) {
+    const updates = new Map();
+    const matches = cursor => cursor.conversation.toLowerCase() === conversation;
+    for (const id of sessionIds) {
+      const state = this.sessions.get(id);
+      if (!state) continue;
+      const checkpoints = state.checkpoints?.filter(cursor => !matches(cursor));
+      const recoveries = state.recoveries?.filter(attempt => !matches(attempt.origin));
+      const deletingHead = matches(state);
+      if (!deletingHead && checkpoints?.length === state.checkpoints?.length &&
+          recoveries?.length === state.recoveries?.length) continue;
+      const cursor = !deletingHead && (state.parent !== null || recoveries?.length)
+        ? state : checkpoints?.at(-1) ?? recoveries?.at(-1)?.origin;
+      updates.set(id, cursor && { ...cursor, checkpoints, recoveries: recoveries?.length ? recoveries : undefined });
+    }
+    return updates;
+  }
+
+  async deleteConversation(key, conversation, bindings) {
+    if (this.conversationQueue.has(conversation) || this.deletingConversations.has(conversation) ||
+        [...bindings.keys()].some(id => this.pending.has(id))) throw sessionBusy();
+    this.deletingConversations.add(conversation);
+    try {
+      // Finish local cleanup even if the client disconnects while 1C handles the request.
+      try {
+        const response = await this.request(key, '/conversations/' + encodeURIComponent(conversation),
+          undefined, undefined, false, 'DELETE');
+        if (response.status !== 204)
+          throw new Fault(502, 'bad_delete_response', 'Напарник не подтвердил удаление диалога.');
+      } catch (error) {
+        if (error.status !== 404 || error.code !== 'resource_not_found') throw error;
+      }
+      for (const [id, cursor] of bindings) {
+        if (cursor) this.sessions.set(id, cursor);
+        else this.sessions.delete(id);
+      }
+      for (const [group, callback] of this.toolCallbacks) {
+        if (callback.state.conversation.toLowerCase() === conversation) this.toolCallbacks.delete(group);
+      }
+      const checkpoints = this.getTranscriptCheckpoints();
+      const retained = new Map([...checkpoints].filter(([, state]) => state?.conversation.toLowerCase() !== conversation));
+      if (retained.size !== checkpoints.size) this.saveTranscriptCheckpoints(retained);
+    } finally {
+      this.deletingConversations.delete(conversation);
     }
   }
 
@@ -610,7 +668,8 @@ export class Bridge {
       const path = '/conversations/' + encodeURIComponent(binding.conversation) + '/title';
       let response;
       try {
-        response = await this.request(key, path, undefined, titleSignal, false, 'POST');
+        response = await this.inConversation(binding.conversation, titleSignal,
+          () => this.request(key, path, undefined, titleSignal, false, 'POST'));
       } catch (error) {
         signal.throwIfAborted();
         if (error.status !== 424 || error.code !== 'insufficient_context') throw error;
@@ -640,7 +699,7 @@ export class Bridge {
   }
 
   async generate(key, payload, signal, onPart, onServerCall = () => {}, onMetrics) {
-    const { protocol, sessionId, messages, titleRequest } = payload;
+    const { protocol, sessionId, messages, titleRequest, completeHistory } = payload;
     const id = sessionId ? JSON.stringify([protocol, sessionId]) : null;
     if (titleRequest) {
       const reply = await this.generateTitle(key, id, signal);
@@ -653,9 +712,11 @@ export class Bridge {
       const stored = id && this.sessions.get(id);
       const checkpoints = stored?.checkpoints ?? [];
       const lastAssistant = messages.findLastIndex(message => message.role === 'assistant');
-      const seed = lastAssistant < 0 ? checkpoints.at(-1)?.fingerprint : undefined;
+      const firstMessage = messages.find(message => message.role !== 'system' && message.role !== 'developer');
+      const freshHistory = completeHistory && lastAssistant < 0 && firstMessage?.role !== 'tool';
+      const seed = !freshHistory && lastAssistant < 0 ? checkpoints.at(-1)?.fingerprint : undefined;
       const fingerprints = id ? transcriptFingerprints(key, messages, seed) : [];
-      let previous = stored?.parent ? stored : undefined;
+      let previous = !freshHistory && stored?.parent ? stored : undefined;
       let from = 0;
       if (previous && lastAssistant >= 0) {
         if (stored.checkpoints === undefined) {
@@ -728,6 +789,38 @@ export class Bridge {
     }
   }
 
+  getTranscriptCheckpoints() {
+    return this.transcriptCheckpoints ??= this.sessions.loadTranscriptCheckpoints?.() ?? new Map();
+  }
+
+  saveTranscriptCheckpoints(checkpoints) {
+    this.sessions.saveTranscriptCheckpoints?.(checkpoints);
+    this.transcriptCheckpoints = checkpoints;
+  }
+
+  readTranscriptRecovery(id, previous, fingerprint) {
+    const matches = cursor => cursor?.conversation === previous.conversation && cursor.parent === previous.parent;
+    const saved = this.getTranscriptCheckpoints().get(id);
+    if (!matches(saved)) return {};
+    const recovery = saved.recoveries?.find(item => item.fingerprint === fingerprint);
+    return {
+      recovery, retry: Boolean(recovery),
+      onRecovery: (origin, posts, consumedPrefix) => {
+        const latest = this.getTranscriptCheckpoints();
+        const cursor = latest.get(id);
+        if (!matches(cursor)) return;
+        const recoveries = (cursor.recoveries ?? []).filter(item => item.fingerprint !== fingerprint);
+        if (!posts.length && recoveries.length === (cursor.recoveries?.length ?? 0)) return;
+        if (posts.length) recoveries.push({ fingerprint, origin, posts: structuredClone(posts),
+          base: { conversation: previous.conversation, parent: previous.parent },
+          ...(consumedPrefix && { consumedPrefix }) });
+        const next = new Map(latest);
+        next.set(id, { ...cursor, recoveries: recoveries.length ? recoveries : undefined });
+        this.saveTranscriptCheckpoints(next);
+      }
+    };
+  }
+
   async generateWithoutSession(key, payload, signal, onPart, onServerCall, onMetrics) {
     const { messages, protocol } = payload;
     const account = createHash('sha256').update(key).digest('hex');
@@ -743,14 +836,25 @@ export class Bridge {
       requireInput(callback?.account === account && callback.protocol === protocol,
         'Не найден исходный вызов инструмента для этого запроса.');
       const results = tail.filter(message => message.role === 'tool');
-      requireInput(results.length === callback.ids.size && new Set(results.map(message => message.id)).size === results.length &&
-        results.every((message, i) => message === tail[i] && callback.ids.has(message.id)),
+      const matchesBatch = entries => entries.length === callback.ids.size &&
+        new Set(entries.map(({ id }) => id)).size === entries.length && entries.every(({ id }) => callback.ids.has(id));
+      requireInput(matchesBatch(results) && results.every((message, i) => message === tail[i]),
         'Передайте результаты всех инструментов из одного ответа сразу после вызовов.');
-      requireInput(lastAssistant < 0 ||
-        transcriptFingerprints(key, [messages[lastAssistant]])[0] === callback.fingerprint,
+      // Clients can normalize assistant history when replaying a completed batch.
+      requireInput(lastAssistant < 0 || matchesBatch(messages[lastAssistant].calls ?? []),
         'Результаты инструментов не соответствуют сообщению ассистента.');
       input = [...results.map(message => ({ ...message, id: callback.ids.get(message.id) })), ...tail.slice(results.length)];
     }
+
+    // A full replay can identify a saved branch without a client session ID.
+    const checkpoints = this.getTranscriptCheckpoints();
+    const fingerprints = transcriptFingerprints(key, messages, lastAssistant < 0 ? callback?.historyFingerprint : undefined);
+    const headFingerprint = callback?.historyFingerprint ?? fingerprints[lastAssistant];
+    const head = headFingerprint && transcriptKey(protocol, headFingerprint);
+    const previous = callback?.state ?? checkpoints.get(head);
+    if (previous && !callback) input = tail;
+    const inputFingerprint = previous && inputDigest(key, input);
+    const readRecovery = previous && head ? () => this.readTranscriptRecovery(head, previous, inputFingerprint) : undefined;
 
     const group = relayToolPrefix + randomUUID();
     const ids = new Map();
@@ -760,11 +864,25 @@ export class Bridge {
       return id;
     };
     const { reply, state } = await this.generateTurn(
-      key, { ...payload, messages: input, publicCallId }, callback?.state, signal, onPart, onServerCall, onMetrics
+      key, { ...payload, messages: input, publicCallId, readRecovery }, previous, signal, onPart, onServerCall, onMetrics
     );
+    const [historyFingerprint] = transcriptFingerprints(key, [reply], fingerprints.at(-1));
+    if (state.parent) {
+      // Re-read after generation so overlapping turns don't overwrite each other's checkpoints.
+      const latest = this.getTranscriptCheckpoints();
+      const id = transcriptKey(protocol, historyFingerprint);
+      const saved = latest.get(id);
+      if (saved !== null) {
+        const next = new Map(latest);
+        next.delete(id);
+        const ambiguous = saved && (saved.conversation !== state.conversation || saved.parent !== state.parent);
+        next.set(id, ambiguous ? null : { ...sessionCheckpoint(historyFingerprint, state), recoveries: saved?.recoveries });
+        if (next.size > maxTranscriptCheckpoints) next.delete(next.keys().next().value);
+        this.saveTranscriptCheckpoints(next);
+      }
+    }
     if (ids.size) {
-      const [fingerprint] = transcriptFingerprints(key, [reply]);
-      this.toolCallbacks.set(group, { account, protocol, state, ids, fingerprint });
+      this.toolCallbacks.set(group, { account, protocol, state, ids, historyFingerprint });
       if (this.toolCallbacks.size > maxToolCallbacks) this.toolCallbacks.delete(this.toolCallbacks.keys().next().value);
     }
     return reply;
@@ -772,7 +890,7 @@ export class Bridge {
 
   async generateTurn(key, payload, previous, signal, onPart, onServerCall, onMetrics) {
     signal = AbortSignal.any([signal, AbortSignal.timeout(longOperationMs)]);
-    const { recovery, retry, onRecovery } = payload;
+    let { recovery, retry, onRecovery } = payload;
     const matchedPrevious = previous;
     if (recovery && (retry || !previous)) previous = recovery.origin;
     let conversation = previous?.conversation;
@@ -789,8 +907,12 @@ export class Bridge {
         throw new Fault(502, 'missing_conversation', 'Напарник не вернул идентификатор диалога.');
       conversation = created.uuid;
     }
-    payload.onConversation?.(conversation);
     return this.inConversation(conversation, signal, async () => {
+      payload.onConversation?.(conversation);
+      if (payload.readRecovery) {
+        ({ recovery, retry, onRecovery } = payload.readRecovery());
+        if (retry) previous = recovery.origin;
+      }
       let ignoredToolRows;
       let consumedPrefix = retry ? recovery.consumedPrefix : undefined;
       if (consumedPrefix) {
@@ -834,8 +956,10 @@ export class Bridge {
       };
       const posts = retry ? structuredClone(recovery.posts) : [];
       const trackPosts = onRecovery && (() => onRecovery(origin, posts, consumedPrefix));
-      return this.generateInConversation(key, { ...payload, trackPosts, ignoredToolRows }, previous, conversation, signal,
+      const result = await this.generateInConversation(key, { ...payload, trackPosts, ignoredToolRows }, previous, conversation, signal,
         onPart, onServerCall, onMetrics, posts);
+      if (payload.readRecovery) onRecovery?.(origin, []);
+      return result;
     });
   }
 
@@ -971,7 +1095,7 @@ export class Bridge {
           if (packet.role === 'assistant' && packet.content) {
             drafts.delete(packet.uuid);
             answered = true;
-            finalizedAnswers.set(packet.uuid, digest(key, [packet.content.content || '', packet.content.tool_calls ?? []]));
+            finalizedAnswers.set(packet.uuid, assistantDigest(key, packet.content));
           }
           saveProgress();
         }
@@ -1006,7 +1130,7 @@ export class Bridge {
       const lastDelivered = rows.findLastIndex(row => delivered.has(row.uuid));
       const prefix = rows.slice(0, lastDelivered + 1);
       if (prefix.some(row => row.role === 'assistant' && (!delivered.has(row.uuid) ||
-          finalizedAnswers.get(row.uuid) !== digest(key, [row.content?.content || '', row.content?.tool_calls ?? []]))) ||
+          finalizedAnswers.get(row.uuid) !== assistantDigest(key, row.content))) ||
           prefix.filter(row => delivered.has(row.uuid)).some((row, position) => row.uuid !== attempt.finalIds[position]))
         throw recoveryPending();
       attempt.complete = true;
@@ -1059,7 +1183,7 @@ export class Bridge {
     const reviewed = new Set((previous?.serverDecisions ?? []).map((item) => item.tool_call_id));
     let serverDecisions = [];
     let lastAssistant, usage, context;
-    let text = '',
+    let text = '', reasoning = '',
       calls = [];
     for (const [i, { serverDecisions: proposed, ...turn }] of turns.entries()) {
       signal.throwIfAborted();
@@ -1096,6 +1220,11 @@ export class Bridge {
         usage = providerUsage(p.usage);
         onMetrics?.(usage, context);
         const part = assistant(p.content.content, p.content.tool_calls ?? []);
+        const thought = confirmedReasoning(p.content);
+        if (thought) {
+          part.reasoning = (reasoning ? '\n\n' : '') + thought;
+          reasoning += part.reasoning;
+        }
         for (const call of part.calls) {
           if (wireNames.has(call.name)) {
             clientCallParents.add(p.uuid);
@@ -1113,7 +1242,7 @@ export class Bridge {
         if (text && part.content) part.content = '\n\n' + part.content;
         text += part.content;
         calls.push(...part.calls);
-        if (part.content || part.calls.length) {
+        if (part.reasoning || part.content || part.calls.length) {
           await onPart(part, signal, source);
         }
       }
@@ -1157,7 +1286,7 @@ export class Bridge {
       if (context) this.contextWindow = context.max_context_length;
       onMetrics(usage, context);
     }
-    const reply = { role: 'assistant', content: text, calls };
+    const reply = { role: 'assistant', content: text, calls, ...(reasoning && { reasoning }) };
     return { reply, state: { conversation, parent, serverDecisions, clientNames: knownClientNames } };
   }
 }

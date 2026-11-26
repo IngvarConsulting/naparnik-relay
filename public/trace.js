@@ -1,4 +1,5 @@
 import { panelRequest } from './panel.js';
+import { exchangeLinks, isSavedUserMessage, serverToolLinks } from './trace-links.js';
 import { linkedScroll, scrollAnchors } from './trace-scroll.js';
 import { renderPacketBody } from './trace-syntax.js';
 
@@ -166,12 +167,6 @@ function requestLine(packet, className) {
 function isStreamStartFrame(body) {
   return body?.type === 'message_start' || (body?.object === 'chat.completion.chunk' &&
     Array.isArray(body.choices) && body.choices.some(choice => choice?.delta?.role === 'assistant'));
-}
-
-function isSavedUserMessage(packet) {
-  const body = packet.body;
-  return packet.kind === 'sse' && body?.role === 'user' && body.finished === true && Boolean(body.uuid) &&
-    body.content == null && body.content_delta == null;
 }
 
 function isAssistantBeginning(packet) {
@@ -408,57 +403,6 @@ function toolResultLinks(records) {
   return links;
 }
 
-function exchangeLinks(client, upstream, exchangeId, toolResults) {
-  const clientIds = new Set(client.map(packet => String(packet.id)));
-  const upstreamIds = new Set(upstream.map(packet => String(packet.id)));
-  const peers = new Map();
-  const connections = [];
-  const serverToolSources = new Set();
-  const connect = (from, to, fromSide, toSide, { indirect = false, toolResult = false, draw = true } = {}) => {
-    if (peers.get(from)?.has(to)) return;
-    for (const [owner, peer, side] of [[from, to, toSide], [to, from, fromSide]]) {
-      if (!peers.has(owner)) peers.set(owner, new Map());
-      peers.get(owner).set(peer, { side, indirect, toolResult: toolResult && (owner === from ? 'result' : 'call') });
-    }
-    if (draw) connections.push({ from, to, indirect });
-  };
-  for (const packet of client) {
-    const source = String(packet.source ?? '');
-    if (upstreamIds.has(source)) connect(source, String(packet.id), 'upstream', 'client');
-  }
-  const assistantCalls = new Map();
-  const userPosts = new Set();
-  for (const packet of upstream) {
-    const id = String(packet.id);
-    const source = String(packet.source ?? '');
-    const body = packet.body;
-    const messagePost = packet.kind === 'request' && packet.method === 'POST' && packet.path?.endsWith('/messages');
-    if (messagePost && (body?.role == null || body.role === 'user')) userPosts.add(id);
-    const call = String(packet.call ?? '');
-    if (isSavedUserMessage(packet) && userPosts.has(call)) connect(call, id, 'upstream', 'upstream');
-    if (packet.kind === 'sse' && body?.finished === true && body.role === 'assistant' &&
-        body.uuid && Array.isArray(body.content?.tool_calls)) {
-      const toolIds = new Set(body.content.tool_calls.map(call => call?.id).filter(Boolean));
-      assistantCalls.set(body.uuid, { id, toolIds });
-    }
-    const parent = assistantCalls.get(body?.parent_uuid);
-    const launchesTool = messagePost && body?.role === 'tool' && parent && Array.isArray(body.content) && body.content.length &&
-      body.content.every(result => parent.toolIds.has(result?.tool_call_id) && result.content === null &&
-        (result.status === 'accepted' || result.status === 'rejected'));
-    if (launchesTool) {
-      if (body.content.length === parent.toolIds.size) serverToolSources.add(parent.id);
-      if (clientIds.has(source)) connect(source, parent.id, 'client', 'upstream', { indirect: true });
-      connect(parent.id, id, 'upstream', 'upstream');
-    } else if (clientIds.has(source)) {
-      connect(source, id, 'client', 'upstream');
-    }
-  }
-  for (const { from, to, resultExchange } of toolResults) {
-    connect(from, to, 'client', 'client', { toolResult: true, draw: exchangeId === resultExchange });
-  }
-  return { peers, connections, serverToolSources };
-}
-
 function traceCards(packets, side) {
   const requests = new Set(packets.filter(packet => packet.kind === 'request').map(packet => String(packet.id)));
   const clientRequest = side === 'client' && requests.size === 1 ? requests.values().next().value : undefined;
@@ -508,10 +452,12 @@ function renderExchanges(records, session) {
   const sides = Object.keys(panes);
   const positions = Object.fromEntries(sides.map(side => [side, panes[side].list.firstElementChild]));
   const toolResults = toolResultLinks(records);
+  const serverTools = serverToolLinks(records);
   for (const record of records) {
     let row = exchangeRows.get(record.id);
     const toolLinks = toolResults.get(record.id) ?? [];
-    const signature = JSON.stringify([record, toolLinks]);
+    const launches = serverTools.get(record.id) ?? [];
+    const signature = JSON.stringify([record, toolLinks, launches]);
     if (!row || row.signature !== signature) {
       const opened = new Set(row?.packetIds.filter(id => packetRows.get(id)?.details.open));
       if (row) {
@@ -522,7 +468,7 @@ function renderExchanges(records, session) {
       }
       const upstreamPackets = record.upstream ?? [];
       const clientPackets = linkContextFrames(record.client ?? [], upstreamPackets);
-      const { peers, connections, serverToolSources } = exchangeLinks(clientPackets, upstreamPackets, record.id, toolLinks);
+      const { peers, connections, serverToolSources } = exchangeLinks(clientPackets, upstreamPackets, record.id, toolLinks, launches);
       const start = clientPackets.find(packet => packet.kind === 'sse' && isStreamStartFrame(packet.body));
       const streamStartSource = start?.source == null ? undefined : String(start.source);
       row = { signature, sections: {}, packetIds: [], connections };

@@ -96,6 +96,26 @@ export class SessionBindings {
       if (error.code !== 'ENOENT') throw error;
     }
   }
+
+  loadTranscriptCheckpoints() {
+    try {
+      const entries = JSON.parse(readFileSync(this.path('relay:transcript-checkpoints'), 'utf8'));
+      if (!Array.isArray(entries) || !entries.every(entry => Array.isArray(entry) && entry.length === 2 &&
+          typeof entry[0] === 'string' && (entry[1] === null || isCursor(entry[1]) &&
+            (entry[1].recoveries === undefined || Array.isArray(entry[1].recoveries) && entry[1].recoveries.every(isRecovery))))) {
+        throw new Error('Повреждены сохранённые контрольные точки истории диалогов.');
+      }
+      return new Map(entries);
+    } catch (error) {
+      if (error.code === 'ENOENT') return new Map();
+      throw error;
+    }
+  }
+
+  saveTranscriptCheckpoints(checkpoints) {
+    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    writePrivateJSON(this.path('relay:transcript-checkpoints'), [...checkpoints]);
+  }
 }
 
 export function load() {

@@ -14,14 +14,21 @@ test('Оба клиента, ключи, история, поток и ошиб�
     titleRequests = [];
   let id = 0,
     breaking = null,
+    budgetFailure = false,
+    budget = {
+      sliding_5h: { used_percent: 12.5, resets_at: '2026-12-01T10:00:00Z' },
+      weekly: { used_percent: 2, resets_at: '2026-12-06T10:00:00Z' }
+    },
     missingContext = false,
     toolArguments = '{ "x" : 1 }';
   const mock = http.createServer(async (req, res) => {
     assert.equal(req.headers.authorization, 'Bearer real-fixture');
     if (req.url === '/budget') {
-      res.end(
-        JSON.stringify({ limits: { sliding_5h: { used_percent: 12.5 }, weekly: { used_percent: 2 } } })
-      );
+      if (budgetFailure) {
+        res.writeHead(503).end(JSON.stringify({ error_type: 'connection' }));
+      } else {
+        res.end(JSON.stringify({ limits: budget }));
+      }
       return;
     }
     if (req.url === '/conversations') {
@@ -248,6 +255,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
   });
   const updateResponse = await post('messages', {
     ...titleInput,
+    system: [{ type: 'text', text: titleInput.system }],
     messages: [{role: 'user', content: [{type: 'text',
       text: 'Update the session title from this JSON object:\n' +
         JSON.stringify({ currentTitle: 'A generated title', messages: [
@@ -310,6 +318,30 @@ test('Оба клиента, ключи, история, поток и ошиб�
   const quota = await post('chat/completions', { messages }, oa);
   assert.equal(quota.status, 429);
   assert.equal((await quota.json()).error.code, 'insufficient_quota');
+  const exhausted = await (await request('/panel/state', undefined, header)).json();
+  assert.equal(exhausted.problem.code, 'budget_exceeded');
+  assert.equal(exhausted.checked, state.checked);
+  assert.deepEqual(exhausted.limits, state.limits);
+
+  breaking = 'no_active_tariff';
+  const noTariff = await post('messages', { messages }, an);
+  assert.equal(noTariff.status, 402);
+  await noTariff.json();
+  const inactive = await (await request('/panel/state', undefined, header)).json();
+  assert.equal(inactive.problem.code, 'no_active_tariff');
+  assert.equal(inactive.checked, state.checked);
+
+  budgetFailure = true;
+  const unavailable = await (await request('/panel/refresh', undefined, header, 'POST')).json();
+  assert.equal(unavailable.problem.status, 503);
+  assert.deepEqual(unavailable.limits, state.limits);
+  assert.notEqual(unavailable.checked, state.checked);
+
+  budgetFailure = false;
+  budget = { ...budget, sliding_5h: { used_percent: 0, resets_at: '2026-12-01T15:00:00Z' } };
+  const refreshed = await (await request('/panel/refresh', undefined, header, 'POST')).json();
+  assert.equal(refreshed.problem, null);
+  assert.deepEqual(refreshed.limits, budget);
   breaking = 'validation';
   const invalid = await post('messages', { messages }, an);
   assert.equal(invalid.status, 400);

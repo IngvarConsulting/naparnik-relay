@@ -21,31 +21,11 @@
    | API protocol | **Anthropic Messages** |
    | API key | Локальный ключ из панели Relay |
 
-3. Добавьте модель с ID `naparnik`, сохраните провайдера и выполните настройку веб-инструментов ниже. Затем выберите `naparnik` в новой сессии.
+3. Добавьте модель с ID `naparnik`, сохраните провайдера и выберите `naparnik` в новой сессии.
 
 В версиях без **Custom model API** откройте карточку **DeepSeek** в **Settings → Models**. Введите локальный ключ в **API key**, а адрес из таблицы в **Customized settings → Base URL**. Нажмите **Add model**, укажите ID `naparnik` и нажмите **Apply**. Адрес и ключ карточки действуют на все её модели. [Настройка провайдеров Harness](https://deepseek-harness.github.io/deepseek-harness/en/guide/providers)
 
-### Веб-инструменты
-
-Для сессий Напарника выключите встроенный `web_search`. Harness выполняет его отдельным запросом. При использовании карточки DeepSeek запрос может отправить локальный ключ Relay на сервер DeepSeek и получить `401`. [Аутентификация поиска Harness](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/web/web-search-deepseek/README.md#authentication)
-
-1. В **Agent presets** найдите пресет, который используется в сессиях Напарника. Обычно это **Standard**. Откройте **View configuration**, чтобы посмотреть список плагинов пресета. [Пресеты Harness](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/ui-agent-preset/README.md#use-this-package)
-2. В дочернем плагине `tool-web` задайте `search: false` и `fetch: true`. Если ваша версия позволяет редактировать пресет в интерфейсе, сохраните изменения там. Для просмотра без редактирования используйте `cordis.patch.yml` активного профиля. [Настройки веб-инструментов](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/web/tool-web/README.md)
-
-   В Desktop пользовательский файл находится в `$DSH_HOME/profiles/desktop/cordis.patch.yml` (`~/.dsh/profiles/desktop/cordis.patch.yml` при расположении по умолчанию). Для **Standard**, **PTC** и **Creator** записи пресетов называются `preset-standard`, `preset-ptc` и `preset-cordis` соответственно. Если записи ещё нет, добавьте её с нужным `id` и перенесите полный список плагинов из **View configuration** в её `config.plugins`. Полный список сохраняет остальные инструменты пресета. [Исходный пресет Standard](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/web-app/presets/standard.patch.yml)
-
-   Измените два поля внутри `config` элемента `tool-web`. Ниже показан этот элемент из списка Standard.
-
-   ```yaml
-   - id: tool-web
-     name: '@deepseek-ai/dsh-tool-web'
-     config:
-       search: false
-       fetch: true
-       searchTimeoutMs: 60000
-   ```
-
-3. В **Plugins → Built-in plugin settings → Web search and fetch** установите **Fetch → Direct fetch**. `web_fetch` будет открывать публичные страницы напрямую по заданным URL. Создайте новую сессию с настроенным пресетом. [Прямой HTTP](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/web/web-fetch-http/README.md)
+Встроенный `web_search` использует собственный провайдер поиска. Если хотите пользоваться только поиском Напарника, выключите поиск DeepSeek в настройках Harness. Клиентский `web_fetch` при этом можно использовать в режиме **Direct fetch**. [Настройки поиска Harness](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/web/web-search-deepseek/README.md#authentication)
 
 ## ZCode
 
@@ -61,10 +41,38 @@
 3. Нажмите **Add model**, добавьте и включите модель с ID `naparnik`.
 4. Нажмите **Test model**. После успешной проверки откройте новый чат и выберите `naparnik`. [Настройка провайдеров ZCode](https://zcode.z.ai/en/docs/configuration#custom-providers-anthropic--openai-compatible)
 
+## OpenCode 1.x
+
+Добавьте провайдера в штатный `opencode.json`. Перед запуском OpenCode задайте `NAPARNIK_RELAY_API_KEY` локальным ключом из панели Relay. Для выбора в уже открытом OpenCode используйте `/models` и выберите `1С:Напарник`. [Пользовательский провайдер OpenCode 1.19.6](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/web/src/content/docs/providers.mdx#custom-provider)
+
+```json
+{
+  "model": "relay/naparnik",
+  "provider": {
+    "relay": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Naparnik Relay",
+      "options": {
+        "baseURL": "http://127.0.0.1:47831/v1",
+        "apiKey": "{env:NAPARNIK_RELAY_API_KEY}"
+      },
+      "models": { "naparnik": { "name": "1С:Напарник" } }
+    }
+  }
+}
+```
+
+## Другие клиенты
+
+В штатных настройках провайдера укажите локальный API-ключ Relay и модель `naparnik`. Выберите протокол, который поддерживает клиент, и задайте Base URL так, чтобы конечный адрес совпадал с маршрутом в таблице. Некоторые клиенты добавляют `/v1` сами.
+
+| Протокол | Конечный адрес генерации |
+| --- | --- |
+| Anthropic Messages | `http://127.0.0.1:47831/v1/messages` |
+| OpenAI Chat Completions | `http://127.0.0.1:47831/v1/chat/completions` |
+
 ## Проверка
 
-Отправьте в новом чате `naparnik` короткий запрос, например «Ответь одним словом: готово». Проверьте ответ в клиенте и запись в журнале панели Relay. Оба клиента используют штатный потоковый режим своего протокола.
-
-В Harness для проверки веб-инструментов попросите открыть известный публичный URL. В карточке инструмента должен появиться `web_fetch`.
+В новом чате `naparnik` попросите запомнить слово, затем спросите это слово следующим сообщением. Оба клиента используют штатный потоковый режим. В трассировке второй запрос должен продолжить диалог по `parent_uuid` первого ответа. Relay может сопоставить ветку по истории `messages`, когда клиент не передаёт ID сессии.
 
 Если подключения нет, откройте `http://127.0.0.1:47831/health` с портом вашего Relay. Ответ с `"ready": true` подтверждает, что шлюз запущен. Если шлюз отвечает, проверьте локальный ключ, Base URL и ID модели по инструкции для клиента.

@@ -1,12 +1,15 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { Fault, MODEL } from './bridge.js';
 
 function toolCall(c) {
   return { id: c.id, type: 'function', function: { name: c.name, arguments: c.args } };
 }
-function blocks(part) {
-  const result = part.content ? [{ type: 'text', text: part.content }] : [];
+function blocks(part, thinkingSignature) {
+  const result = [];
+  if (part.reasoning) result.push({ type: 'thinking', thinking: part.reasoning,
+    signature: thinkingSignature(part.reasoning) });
+  if (part.content) result.push({ type: 'text', text: part.content });
   for (const c of part.calls) {
     let input;
     try {
@@ -20,7 +23,7 @@ function blocks(part) {
   }
   return result;
 }
-export function completion(res, anthropic, stream, includeUsage, trace) {
+export function completion(res, anthropic, stream, includeUsage, trace, key) {
   const id = (anthropic ? 'msg_' : 'chatcmpl-') + randomUUID();
   const base = { id, model: MODEL };
   const created = Math.floor(Date.now() / 1000);
@@ -29,6 +32,9 @@ export function completion(res, anthropic, stream, includeUsage, trace) {
     callIndex = 0,
     timer;
   let usage, context;
+  // Relay issues its own opaque signature so clients can preserve the typed block.
+  const thinkingSignature = thinking => createHmac('sha256', key)
+    .update(JSON.stringify(['thinking', id, index, thinking])).digest('base64');
   const sources = trace && new Set();
   const contextField = () => context ? { naparnik_context: context } : {};
   const anthropicUsage = () => {
@@ -84,22 +90,33 @@ export function completion(res, anthropic, stream, includeUsage, trace) {
     waiting(source) { if (stream) start(source); },
     async part(part, signal, source) {
       if (source) sources?.add(source);
-      const contentBlocks = anthropic ? blocks(part) : undefined;
+      const contentBlocks = anthropic ? blocks(part, thinkingSignature) : undefined;
       if (!stream) return;
       start(source);
       if (anthropic) {
         let toolIndex = 0;
         for (const block of contentBlocks) {
-          const isText = block.type === 'text';
-          const content_block = isText ? { type: 'text', text: '' } : { ...block, input: {} };
+          let content_block, delta;
+          if (block.type === 'thinking') {
+            content_block = { ...block, thinking: '', signature: '' };
+            delta = { type: 'thinking_delta', thinking: block.thinking };
+          } else if (block.type === 'text') {
+            content_block = { type: 'text', text: '' };
+            delta = { type: 'text_delta', text: block.text };
+          } else {
+            content_block = { ...block, input: {} };
+            delta = { type: 'input_json_delta', partial_json: part.calls[toolIndex++].args };
+          }
           await flush(frame({ type: 'content_block_start', index, content_block }, source), signal);
-          const delta = isText
-            ? { type: 'text_delta', text: block.text }
-            : { type: 'input_json_delta', partial_json: part.calls[toolIndex++].args };
           await flush(frame({ type: 'content_block_delta', index, delta }, source), signal);
+          if (block.type === 'thinking') {
+            await flush(frame({ type: 'content_block_delta', index,
+              delta: { type: 'signature_delta', signature: block.signature } }, source), signal);
+          }
           await flush(frame({ type: 'content_block_stop', index: index++ }, source), signal);
         }
       } else {
+        if (part.reasoning) await flush(chunk({ reasoning_content: part.reasoning }, null, source), signal);
         if (part.content) await flush(chunk({ content: part.content }, null, source), signal);
         if (part.calls.length) {
           const tool_calls = part.calls.map(call => ({ index: callIndex++, ...toolCall(call) }));
@@ -131,7 +148,7 @@ export function completion(res, anthropic, stream, includeUsage, trace) {
         return;
       }
       const result = anthropic
-        ? message(blocks(reply), reason)
+        ? message(blocks(reply, thinkingSignature), reason)
         : {
             ...base,
             created,
@@ -146,6 +163,7 @@ export function completion(res, anthropic, stream, includeUsage, trace) {
                 message: {
                   role: 'assistant',
                   content: reply.content || (tools ? null : ''),
+                  ...(reply.reasoning && { reasoning_content: reply.reasoning }),
                   ...(tools ? { tool_calls: reply.calls.map(toolCall) } : {})
                 }
               }

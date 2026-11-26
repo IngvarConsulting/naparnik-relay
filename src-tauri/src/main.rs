@@ -1,11 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        mpsc, Mutex, MutexGuard,
     },
     time::Duration,
 };
@@ -18,16 +18,126 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+type DesktopError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Default)]
-struct Service(Mutex<Option<Child>>);
+enum ServiceState {
+    #[default]
+    Stopped,
+    Starting(Option<Child>),
+    Running {
+        child: Child,
+        origin: String,
+    },
+    Paused,
+    Exiting,
+}
+
+#[derive(Default)]
+struct ServiceProcess {
+    state: ServiceState,
+    attempt: u64,
+}
+
+#[derive(Default)]
+struct Service(Mutex<ServiceProcess>);
 
 impl Service {
-    fn stop(&self) {
-        if let Some(mut child) = self.0.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
+    fn lock(&self) -> MutexGuard<'_, ServiceProcess> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_start(&self) -> io::Result<Option<u64>> {
+        let mut process = self.lock();
+        let start = match &mut process.state {
+            ServiceState::Stopped => true,
+            ServiceState::Running { child, .. } => child.try_wait()?.is_some(),
+            ServiceState::Starting(_) | ServiceState::Paused | ServiceState::Exiting => false,
+        };
+        if !start {
+            return Ok(None);
+        }
+        process.state = ServiceState::Starting(None);
+        process.attempt += 1;
+        Ok(Some(process.attempt))
+    }
+
+    fn attach(&self, attempt: u64, child: Child) -> bool {
+        let mut process = self.lock();
+        if process.attempt == attempt {
+            if let ServiceState::Starting(slot @ None) = &mut process.state {
+                *slot = Some(child);
+                return true;
+            }
+        }
+        drop(process);
+        terminate(child);
+        false
+    }
+
+    fn started(&self, attempt: u64, url: &tauri::Url) -> bool {
+        let mut process = self.lock();
+        if process.attempt == attempt {
+            if let ServiceState::Starting(child) = &mut process.state {
+                if let Some(child) = child.take() {
+                    process.state = ServiceState::Running {
+                        child,
+                        origin: url.origin().ascii_serialization(),
+                    };
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn failed(&self, attempt: u64) -> bool {
+        let mut process = self.lock();
+        if process.attempt != attempt || !matches!(process.state, ServiceState::Starting(_)) {
+            return false;
+        }
+        let state = std::mem::take(&mut process.state);
+        drop(process);
+        if let ServiceState::Starting(Some(child)) = state {
+            terminate(child);
+        }
+        true
+    }
+
+    fn serves(&self, url: &tauri::Url) -> bool {
+        matches!(&self.lock().state, ServiceState::Running { origin, .. }
+            if *origin == url.origin().ascii_serialization())
+    }
+
+    fn stop(&self, next: ServiceState) {
+        let mut process = self.lock();
+        if matches!(process.state, ServiceState::Exiting) {
+            return;
+        }
+        let state = std::mem::replace(&mut process.state, next);
+        drop(process);
+        if let ServiceState::Running { child, .. } | ServiceState::Starting(Some(child)) = state {
+            terminate(child);
         }
     }
+
+    fn resume(&self) -> bool {
+        let mut process = self.lock();
+        if matches!(process.state, ServiceState::Paused) {
+            process.state = ServiceState::Stopped;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn terminate(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn show_panel(app: &AppHandle) {
@@ -45,6 +155,7 @@ fn show_panel(app: &AppHandle) {
             let _ = window.eval("window.dispatchEvent(new Event('relay-panel-opened'))");
         }
     }
+    ensure_service(app);
 }
 
 #[cfg(target_os = "macos")]
@@ -92,6 +203,37 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Naparnik Relay")
         .menu(&menu)
         .build(app)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn create_macos_menu(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::Submenu;
+
+    let application = Submenu::with_items(
+        app,
+        "Naparnik Relay",
+        true,
+        &[&PredefinedMenuItem::quit(
+            app,
+            Some("Завершить Naparnik Relay"),
+        )?],
+    )?;
+    let edit = Submenu::with_items(
+        app,
+        "Правка",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, Some("Отменить"))?,
+            &PredefinedMenuItem::redo(app, Some("Повторить"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, Some("Вырезать"))?,
+            &PredefinedMenuItem::copy(app, Some("Копировать"))?,
+            &PredefinedMenuItem::paste(app, Some("Вставить"))?,
+            &PredefinedMenuItem::select_all(app, Some("Выбрать всё"))?,
+        ],
+    )?;
+    app.set_menu(Menu::with_items(app, &[&application, &edit])?)?;
     Ok(())
 }
 
@@ -149,7 +291,6 @@ impl AuxiliaryPanel {
             return window.set_focus();
         }
 
-        let origin = url.origin();
         let handle = app.clone();
         let popup_handle = app.clone();
         WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
@@ -158,7 +299,7 @@ impl AuxiliaryPanel {
             .min_inner_size(minimum.0, minimum.1)
             .center()
             .on_navigation(move |next| {
-                if next.origin() == origin {
+                if handle.state::<Service>().serves(next) {
                     return true;
                 }
                 open_external(&handle, next);
@@ -194,7 +335,45 @@ impl AuxiliaryPanel {
     }
 }
 
-fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+fn read_startup(
+    out: impl io::Read + Send + 'static,
+    timeout: Duration,
+) -> Result<tauri::Url, DesktopError> {
+    let (reply, startup) = mpsc::sync_channel(1);
+    std::thread::Builder::new().spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(out).read_line(&mut line).map(|_| line);
+        let _ = reply.send(result);
+    })?;
+    let line = startup
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                io::Error::new(io::ErrorKind::TimedOut, "Шлюз не ответил при запуске.")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "Канал запуска шлюза закрылся.")
+            }
+        })??;
+    if line.is_empty() {
+        return Err("Шлюз завершился до запуска.".into());
+    }
+    let startup: serde_json::Value = serde_json::from_str(&line)?;
+    if let Some(message) = startup["error"].as_str() {
+        return Err(message.into());
+    }
+    let url = tauri::Url::parse(
+        startup["url"]
+            .as_str()
+            .ok_or("Шлюз не вернул адрес панели")?,
+    )?;
+    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
+        return Err("Шлюз вернул неверный локальный адрес".into());
+    }
+    Ok(url)
+}
+
+fn start_service(app: &AppHandle, attempt: u64) -> Result<Option<tauri::Url>, DesktopError> {
     let runtime = app.path().resource_dir()?.join("runtime");
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
     let mut command = Command::new(runtime.join(exe));
@@ -210,24 +389,76 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let mut child = command.spawn()?;
-    let out = child.stdout.take().ok_or("Недоступен канал запуска")?;
-    *app.state::<Service>().0.lock().unwrap() = Some(child);
-    let mut line = String::new();
-    BufReader::new(out).read_line(&mut line)?;
-    let startup: serde_json::Value = serde_json::from_str(&line)?;
-    if let Some(message) = startup["error"].as_str() {
-        return Err(message.into());
+    let Some(stdout) = child.stdout.take() else {
+        terminate(child);
+        return Err("Недоступен канал запуска".into());
+    };
+    if !app.state::<Service>().attach(attempt, child) {
+        return Ok(None);
     }
-    let url = tauri::Url::parse(
-        startup["url"]
-            .as_str()
-            .ok_or("Шлюз не вернул адрес панели")?,
-    )?;
-    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
-        return Err("Шлюз вернул неверный локальный адрес".into());
+    read_startup(stdout, STARTUP_TIMEOUT).map(Some)
+}
+
+fn service_error(app: &AppHandle, error: impl std::fmt::Display) {
+    eprintln!("Не удалось открыть панель: {error}");
+    let handle = app.clone();
+    let initial_start = app.get_webview_window("main").is_none();
+    app.dialog()
+        .message(error.to_string())
+        .title("Не удалось открыть Напарник")
+        .show(move |_| {
+            if initial_start && handle.get_webview_window("main").is_none() {
+                handle.exit(1);
+            }
+        });
+}
+
+fn ensure_service(app: &AppHandle) {
+    let attempt = match app.state::<Service>().begin_start() {
+        Ok(None) => return,
+        Err(error) => return service_error(app, error),
+        Ok(Some(attempt)) => attempt,
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let startup = start_service(&app, attempt);
+        let panel_app = app.clone();
+        let service = app.state::<Service>();
+        let scheduled = match startup {
+            Ok(Some(url)) => {
+                if !service.started(attempt, &url) {
+                    return;
+                }
+                app.run_on_main_thread(move || {
+                    if panel_app.state::<Service>().serves(&url) {
+                        if let Err(error) = open_panel(&panel_app, url) {
+                            panel_app.state::<Service>().stop(ServiceState::Stopped);
+                            service_error(&panel_app, error);
+                        }
+                    }
+                })
+            }
+            Ok(None) => return,
+            Err(error) => {
+                if !service.failed(attempt) {
+                    return;
+                }
+                app.run_on_main_thread(move || service_error(&panel_app, error))
+            }
+        };
+        if let Err(error) = scheduled {
+            service.stop(ServiceState::Exiting);
+            eprintln!("Не удалось запланировать открытие панели: {error}");
+        }
+    });
+}
+
+fn open_panel(app: &AppHandle, mut url: tauri::Url) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        // Reload the document with the startup token to replace the previous server's cookie.
+        url.set_query(Some("reconnect"));
+        return window.navigate(url);
     }
-    let origin = url.origin();
-    let popup_origin = origin.clone();
     let handle = app.clone();
     let popup_handle = app.clone();
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
@@ -237,7 +468,7 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .maximizable(false)
         .center()
         .on_navigation(move |next| {
-            if next.origin() == origin {
+            if handle.state::<Service>().serves(next) {
                 if let Some(panel) = AuxiliaryPanel::from_url(next) {
                     panel.schedule(&handle, next.clone());
                     return false;
@@ -248,7 +479,7 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             false
         })
         .on_new_window(move |target, _| {
-            if target.origin() == popup_origin {
+            if popup_handle.state::<Service>().serves(&target) {
                 if let Some(panel) = AuxiliaryPanel::from_url(&target) {
                     panel.schedule(&popup_handle, target);
                     return NewWindowResponse::Deny;
@@ -261,7 +492,7 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn check_update(app: &AppHandle) -> Result<(), DesktopError> {
     let window = app
         .get_webview_window("main")
         .ok_or("Окно приложения закрыто")?;
@@ -269,7 +500,7 @@ async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error +
     let updater = app
         .updater_builder()
         .timeout(Duration::from_secs(90))
-        .on_before_exit(move || handle.state::<Service>().stop())
+        .on_before_exit(move || handle.state::<Service>().stop(ServiceState::Paused))
         .build()?;
     let Some(update) = updater.check().await? else {
         app.dialog()
@@ -300,8 +531,13 @@ async fn check_update(app: &AppHandle) -> Result<(), Box<dyn std::error::Error +
         let _ = window.set_title(&format!("{title} — Загружаем обновление…"));
         let result = update.download_and_install(|_, _| {}, || {}).await;
         let _ = window.set_title(&title);
-        result?;
-        app.state::<Service>().stop();
+        if let Err(error) = result {
+            if app.state::<Service>().resume() {
+                ensure_service(app);
+            }
+            return Err(error.into());
+        }
+        app.state::<Service>().stop(ServiceState::Exiting);
         app.restart();
     }
     Ok(())
@@ -360,18 +596,14 @@ fn main() {
             }
         })
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if let Err(e) = create_macos_menu(app.handle()) {
+                eprintln!("Не удалось создать системное меню Naparnik Relay: {e}");
+            }
             if let Err(e) = create_tray(app.handle()) {
                 eprintln!("Не удалось создать значок Naparnik Relay: {e}");
             }
-            if let Err(e) = open_panel(app.handle()) {
-                eprintln!("Не удалось открыть панель: {e}");
-                app.state::<Service>().stop();
-                let handle = app.handle().clone();
-                app.dialog()
-                    .message(e.to_string())
-                    .title("Не удалось открыть Напарник")
-                    .show(move |_| handle.exit(1));
-            }
+            ensure_service(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -386,7 +618,57 @@ fn main() {
             show_panel(app);
         }
         if let tauri::RunEvent::Exit = event {
-            app.state::<Service>().stop();
+            app.state::<Service>().stop(ServiceState::Exiting);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_reads_the_local_address() {
+        let reply = br#"{"url":"http://127.0.0.1:47831/#fake-token"}"#;
+        let url = read_startup(&reply[..], Duration::from_secs(1)).expect("valid startup reply");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.fragment(), Some("fake-token"));
+    }
+
+    #[test]
+    fn startup_has_a_deadline_when_the_child_is_silent() {
+        struct Silent(mpsc::Receiver<()>);
+
+        impl io::Read for Silent {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+
+        let (release, silent) = mpsc::channel();
+        let result = read_startup(Silent(silent), Duration::from_millis(20));
+        drop(release);
+        let error = result.expect_err("silent child must time out");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[test]
+    fn cancelled_startup_cannot_replace_a_newer_attempt() {
+        let service = Service::default();
+        let old = service.begin_start().unwrap().unwrap();
+        service.stop(ServiceState::Paused);
+        assert_eq!(service.begin_start().unwrap(), None);
+        assert!(service.resume());
+        let current = service.begin_start().unwrap().unwrap();
+        assert!(!service.failed(old));
+        assert!(service.failed(current));
+        service.stop(ServiceState::Exiting);
+        service.stop(ServiceState::Paused);
+        assert!(!service.resume());
+        assert_eq!(service.begin_start().unwrap(), None);
+    }
 }

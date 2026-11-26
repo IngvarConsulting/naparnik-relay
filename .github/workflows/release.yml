@@ -71,4 +71,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v$(node -p 'require("./package.json").version')"
-          gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "Naparnik Relay ${tag}" --notes-file RELEASE.md
+          ref="refs/tags/$tag"
+          if git ls-remote --exit-code origin "$ref" > /dev/null; then
+            echo "Checking existing tag $tag"
+          else
+            status=$?
+            if [ "$status" -ne 2 ]; then exit "$status"; fi
+            git push origin "$GITHUB_SHA:$ref"
+          fi
+          git fetch --no-tags origin "$ref"
+          tagged_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          if [ "$tagged_commit" != "$GITHUB_SHA" ]; then
+            echo "Tag $tag points to $tagged_commit instead of $GITHUB_SHA" >&2
+            exit 1
+          fi
+          gh release create "$tag" dist/* --verify-tag --title "Naparnik Relay ${tag}" --notes-file RELEASE.md

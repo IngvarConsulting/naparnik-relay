@@ -27,7 +27,7 @@ const { load, origin, port, dir } = await import('./state.js');
 
 const connection = load();
 const monitor = new ToolMonitor(join(dir, 'tools.json'));
-const server = createServer({connection, monitor});
+const server = createServer({ connection, monitor, mode: 'desktop' });
 server.once('error', error => {
   const message = error.code === 'EADDRINUSE'
     ? 'Порт ' + port + ' уже занят. Если запущена браузерная версия шлюза, остановите её командой npm stop и снова откройте приложение.'

@@ -19,8 +19,10 @@ function pick(p) {
 function render(data) {
   state = data;
   const ok = data.configured && data.limits && !data.problem;
-  const exhausted = ok && Object.values(data.limits).some((x) => x.used_percent >= 100);
-  $('headline').textContent = data.problem ? 'Проверить связь' : exhausted ? 'Лимит исчерпан' :
+  const exhausted = data.problem?.code === 'budget_exceeded' ||
+    (ok && Object.values(data.limits).some((x) => x.used_percent >= 100));
+  $('headline').textContent = exhausted ? 'Лимит исчерпан' :
+    data.problem?.code === 'no_active_tariff' ? 'Тариф не активен' : data.problem ? 'Проверить связь' :
     ok ? 'Подключено' : data.configured ? 'Проверяем…' : 'Подключить';
   $('home').classList.remove('offline');
   $('quota').hidden = false;
@@ -31,7 +33,7 @@ function render(data) {
   $('refresh').hidden = !data.configured;
   $('model').textContent = data.model;
   for (const button of document.querySelectorAll('.copy')) button.disabled = false;
-  renderLimits(data.problem ? null : data.limits, data.configured);
+  renderLimits(data.limits, data.configured, data.problem);
   pick(profile);
   if (opening) {
     opening = false;
@@ -40,7 +42,7 @@ function render(data) {
     if ($('auth').hidden) showPage();
   }
 }
-function renderLimits(limits, configured) {
+function renderLimits(limits, configured, problem) {
   const hint = [];
   for (const [id, field, label] of [['hours', 'sliding_5h', 'За 5 часов'], ['week', 'weekly', 'За неделю']]) {
     const limit = limits?.[field];
@@ -55,7 +57,8 @@ function renderLimits(limits, configured) {
     hint.push(label + ': ' + display);
   }
   $('quota').querySelector('summary').title = hint.join(' · ');
-  $('quota-note').textContent = limits ? '' : configured ? 'Лимиты временно недоступны.' : 'Подключите аккаунт, чтобы увидеть лимиты.';
+  $('quota-note').textContent = limits ? (problem ? 'Показаны данные последней успешной проверки.' : '') :
+    configured ? 'Лимиты временно недоступны.' : 'Подключите аккаунт, чтобы увидеть лимиты.';
 }
 function offline(e) {
   $('home').classList.add('offline');

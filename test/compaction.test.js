@@ -121,7 +121,7 @@ test('Компактизация удерживает очередь диало�
   try {
     assert.equal(await Promise.race([entered.promise, compact.then(response => response.status)]), undefined);
     const relayReceived = once(app, 'request');
-    continued = post('/chat/completions', chat('after'), session);
+    continued = post('/chat/completions', chat('after'), { ...session, 'x-relay-input': 'delta' });
     await relayReceived;
     await setTimeout(25);
     assert.deepEqual(received.map(({ path }) => path), ['/conversations', `/conversations/${uuid}/messages`, compactPath]);

@@ -7,6 +7,7 @@ const rows = new Map();
 const pendingTools = new Map();
 let savingTools = false;
 let loadingTools = false;
+let toolRevision = 0;
 
 function setFeedback(element, message, error = false) {
   element.textContent = message;
@@ -54,6 +55,7 @@ function render({ tools }) {
 }
 
 async function save(id, enabled) {
+  toolRevision++;
   pendingTools.set(id, enabled);
   setFeedback(feedback, '');
   if (savingTools) return;
@@ -78,14 +80,18 @@ async function save(id, enabled) {
 }
 
 async function load() {
-  if (loadingTools) return;
+  if (loadingTools || savingTools) return;
   loadingTools = true;
+  const revision = toolRevision;
   retry.hidden = true;
-  setFeedback(feedback, 'Загружаем инструменты…');
+  if (!rows.size) setFeedback(feedback, 'Загружаем инструменты…');
   try {
-    render(await panelRequest('tools'));
+    const data = await panelRequest('tools');
+    if (revision !== toolRevision) return;
+    render(data);
     setFeedback(feedback, rows.size ? '' : 'Серверных инструментов пока нет.');
   } catch (error) {
+    if (revision !== toolRevision) return;
     setFeedback(feedback, error.message, true);
     retry.hidden = false;
   } finally {
@@ -94,6 +100,7 @@ async function load() {
 }
 
 retry.addEventListener('click', load);
+window.addEventListener('focus', load);
 void load();
 
 const defaultsForm = document.getElementById('conversation-defaults');
@@ -149,15 +156,18 @@ async function loadDefaults() {
 
 async function saveDefaults() {
   if (savingDefaults) return;
-  // Each PUT writes the full settings. Start the next one from the last confirmed values.
   while (pendingDefaults.size) {
     const changes = [...pendingDefaults];
     pendingDefaults.clear();
-    if (changes.every(([name, value]) => savedDefaults[name] === value)) continue;
-    savingDefaults = { ...savedDefaults };
-    for (const [name, value] of changes) savingDefaults[name] = value;
+    savingDefaults = Object.fromEntries(changes);
     try {
-      savedDefaults = readDefaults(await panelRequest('conversation-defaults', 'PUT', savingDefaults, { keepalive: true }));
+      const previous = savedDefaults;
+      savedDefaults = readDefaults(await panelRequest('conversation-defaults', 'PATCH', savingDefaults, { keepalive: true }));
+      for (const name of defaultsKeys) {
+        if (pendingDefaults.has(name) || previous[name] === savedDefaults[name]) continue;
+        if (name === programmingLanguage && controls[name].value === 'other' && programmingCode.value !== previous[name]) continue;
+        showDefault(name, savedDefaults[name]);
+      }
     } catch (error) {
       for (const [name, value] of changes) {
         if (name === programmingLanguage && controls[name].value === 'other') continue;

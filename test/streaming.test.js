@@ -12,9 +12,11 @@ const uuid = 'stream-answer';
 const conversation = '141f1fc8-3d60-4597-ae5c-61b3ca352f04';
 const finalText = 'clean-answer';
 const finalArguments = '{"ready": "right"}';
-const provisional = /draft|secret|wrong|reasoning_content|relay_preview/;
+const finalReasoning = 'confirmed reasoning';
+const provisional = /draft|secret|wrong|relay_preview/;
 
 async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } = {}) {
+  const sent = [];
   const listen = async server => {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
@@ -32,10 +34,16 @@ async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } 
       }));
     let raw = '';
     for await (const chunk of req) raw += chunk;
-    const { tools } = JSON.parse(raw);
-    const wireName = tools[0].name;
+    const body = JSON.parse(raw);
+    sent.push(body);
     const send = data => res.write('data: ' + JSON.stringify(data) + '\n\n');
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    if (body.role === 'tool') {
+      send({ uuid: 'tool-result', role: 'tool', finished: true, content: body.content[0] });
+      send({ uuid: 'follow-up', role: 'assistant', finished: true, content: { content: 'Done' } });
+      return res.end();
+    }
+    const wireName = body.tools[0].name;
     send({ uuid: 'request', role: 'user', finished: true });
     send({ uuid, role: null, finished: false, content_delta: {
       content: 'draft-', reasoning_content: 'draft reasoning', tool_calls: [
@@ -48,7 +56,7 @@ async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } 
     await waitForFinal;
     if (complete) {
       send({ uuid, role: 'assistant', finished: true, content: {
-        content: finalText, reasoning_content: 'confirmed reasoning', tool_calls: [
+        content: finalText, reasoning_content: finalReasoning, tool_calls: [
           { id: 'final-id', function: { name: wireName, arguments: finalArguments } }
         ]
       } });
@@ -69,15 +77,18 @@ async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } 
     upstream.closeAllConnections();
     rmSync(profileDir, { recursive: true, force: true });
   });
-  return (anthropic, stream = true) => fetch(base + (anthropic ? '/v1/messages' : '/v1/chat/completions'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer local-fixture' },
-    body: JSON.stringify({
-      model: 'naparnik', stream, messages: [{ role: 'user', content: 'Question' }],
-      tools: anthropic ? [{ name: 'lookup', input_schema: { type: 'object' } }] :
-        [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }]
-    })
-  });
+  const post = (anthropic, stream = true, { sessionId, messages = [{ role: 'user', content: 'Question' }] } = {}) =>
+    fetch(base + (anthropic ? '/v1/messages' : '/v1/chat/completions'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer local-fixture',
+        ...(sessionId && { 'X-Session-Id': sessionId }) },
+      body: JSON.stringify({
+        model: 'naparnik', stream, messages,
+        tools: anthropic ? [{ name: 'lookup', input_schema: { type: 'object' } }] :
+          [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }]
+      })
+    });
+  return { post, sent };
 }
 
 async function* frames(stream) {
@@ -110,6 +121,8 @@ function checkStart(frame, anthropic) {
 
 function checkOpenAi(events) {
   const chunks = events.flatMap(frame => frame.data.choices ?? []);
+  assert.deepEqual(chunks.flatMap(choice => choice.delta.reasoning_content ?? []), [finalReasoning]);
+  assert.ok(chunks.findIndex(choice => choice.delta.reasoning_content) < chunks.findIndex(choice => choice.delta.content));
   const text = chunks.flatMap(choice => choice.delta.content || []);
   assert.deepEqual(text, [finalText]);
   const calls = chunks.flatMap(choice => choice.delta.tool_calls ?? []);
@@ -125,12 +138,23 @@ function checkOpenAi(events) {
 
 function checkAnthropic(events) {
   const starts = events.filter(frame => frame.event === 'content_block_start').map(frame => frame.data);
+  const thinking = starts[0];
+  assert.deepEqual(thinking.content_block, { type: 'thinking', thinking: '', signature: '' });
   const tool = starts.find(frame => frame.content_block.type === 'tool_use');
   assert.ok(tool.content_block.id);
   assert.notEqual(tool.content_block.id, 'draft-id');
   assert.equal(tool.content_block.name, 'lookup');
   assert.deepEqual(tool.content_block.input, {});
   const deltas = events.filter(frame => frame.event === 'content_block_delta').map(frame => frame.data);
+  assert.deepEqual(deltas.filter(frame => frame.delta.type === 'thinking_delta'), [{
+    type: 'content_block_delta', index: thinking.index, delta: { type: 'thinking_delta', thinking: finalReasoning }
+  }]);
+  const signature = events.findIndex(frame => frame.data?.delta?.type === 'signature_delta');
+  assert.ok(signature > 0);
+  assert.equal(events[signature].data.index, thinking.index);
+  assert.match(events[signature].data.delta.signature, /^[A-Za-z0-9+/]{43}=$/);
+  assert.equal(events[signature + 1].event, 'content_block_stop');
+  assert.equal(events[signature + 1].data.index, thinking.index);
   assert.deepEqual(deltas.filter(frame => frame.delta.type === 'text_delta').map(frame => frame.delta.text), [finalText]);
   assert.deepEqual(deltas.filter(frame => frame.delta.type === 'input_json_delta'), [{
     type: 'content_block_delta', index: tool.index, delta: { type: 'input_json_delta', partial_json: finalArguments }
@@ -140,9 +164,9 @@ function checkAnthropic(events) {
 }
 
 for (const [name, anthropic] of [['OpenAI', false], ['Anthropic', true]]) {
-  test(`${name} открывает SSE до финала 1С и передаёт подтверждённые текст и аргументы целыми дельтами`, async t => {
+  test(`${name} открывает SSE до финала 1С и передаёт подтверждённый ответ и рассуждение`, async t => {
     const release = Promise.withResolvers();
-    const post = await fixture(t, { waitForFinal: release.promise });
+    const { post } = await fixture(t, { waitForFinal: release.promise });
     const opening = (async () => {
       const response = await post(anthropic);
       assert.equal(response.status, 200);
@@ -165,7 +189,7 @@ for (const [name, anthropic] of [['OpenAI', false], ['Anthropic', true]]) {
   });
 
   test(`${name} завершает оборванный поток SSE-ошибкой и не отправляет черновик`, async t => {
-    const post = await fixture(t, { complete: false });
+    const { post } = await fixture(t, { complete: false });
     const response = await post(anthropic);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /^text\/event-stream\b/);
@@ -180,20 +204,45 @@ for (const [name, anthropic] of [['OpenAI', false], ['Anthropic', true]]) {
 }
 
 test('Без SSE оба протокола возвращают целиком подтверждённые текст и аргументы', async t => {
-  const post = await fixture(t);
+  const { post } = await fixture(t);
   for (const anthropic of [false, true]) {
     const response = await post(anthropic, false);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /^application\/json\b/);
     const data = await response.json();
     if (anthropic) {
-      assert.deepEqual(data.content[0], { type: 'text', text: finalText });
-      assert.deepEqual(data.content[1].input, { ready: 'right' });
+      assert.deepEqual(data.content[0], { type: 'thinking', thinking: finalReasoning, signature: data.content[0].signature });
+      assert.match(data.content[0].signature, /^[A-Za-z0-9+/]{43}=$/);
+      assert.deepEqual(data.content[1], { type: 'text', text: finalText });
+      assert.deepEqual(data.content[2].input, { ready: 'right' });
     } else {
       const message = data.choices[0].message;
       assert.equal(message.content, finalText);
+      assert.equal(message.reasoning_content, finalReasoning);
       assert.equal(message.tool_calls[0].function.arguments, finalArguments);
     }
     assert.doesNotMatch(JSON.stringify(data), provisional);
+  }
+});
+
+test('В обоих протоколах возвращённое рассуждение не меняет ветку и отбрасывается при импорте истории', async t => {
+  const { post, sent } = await fixture(t);
+  for (const anthropic of [false, true]) {
+    const sessionId = anthropic ? 'anthropic' : 'openai';
+    const input = { role: 'user', content: 'Question' };
+    const first = await (await post(anthropic, false, { sessionId, messages: [input] })).json();
+    const assistant = anthropic ? { role: 'assistant', content: first.content } : first.choices[0].message;
+    const id = anthropic ? assistant.content.find(block => block.type === 'tool_use').id : assistant.tool_calls[0].id;
+    const result = anthropic ? { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: '42' }] } :
+      { role: 'tool', tool_call_id: id, content: '42' };
+    const next = await post(anthropic, false, { sessionId, messages: [input, assistant, result] });
+    assert.equal(next.status, 200);
+    assert.equal(sent.at(-1).parent_uuid, uuid);
+    assert.deepEqual(sent.at(-1).content, [{ tool_call_id: id, status: 'ok', content: '42' }]);
+
+    await post(anthropic, false, { sessionId: sessionId + '-new', messages: [input, assistant, { role: 'user', content: 'Next' }] });
+    assert.equal(sent.at(-1).parent_uuid, null);
+    assert.match(sent.at(-1).content, /clean-answer/);
+    assert.doesNotMatch(sent.at(-1).content, /confirmed reasoning|reasoning_content|"type":"thinking"/);
   }
 });

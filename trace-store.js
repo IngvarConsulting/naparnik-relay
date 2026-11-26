@@ -209,6 +209,12 @@ export class TraceStore {
       this.#remove(this.#exchanges.keys().next().value);
   }
 
+  deleteConversation(conversation) {
+    for (const [id, entry] of this.#exchanges) {
+      if (entry.conversation === conversation) this.#remove(id);
+    }
+  }
+
   snapshot(sessionId) {
     const sessions = [...this.#sessions.values()].map(({ id, title, protocol, updated, exchanges }) =>
       ({ id, title, protocol, updated, count: exchanges.size })).sort((a, b) => b.updated.localeCompare(a.updated));

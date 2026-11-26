@@ -70,11 +70,13 @@ test('Настройки диалога сохраняются и применя
       relay, settings,
       get: () => fetch(settings, { headers: panelHeaders }),
       put: value => fetch(settings, { method: 'PUT', headers: panelHeaders, body: JSON.stringify(value) }),
-      send: async sessionId => {
+      patch: value => fetch(settings, { method: 'PATCH', headers: panelHeaders, body: JSON.stringify(value) }),
+      send: async (sessionId, headers) => {
         const response = await fetch(base + '/v1/chat/completions', {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${oldConnection.localKey}`, 'X-Session-ID': sessionId, 'Content-Type': 'application/json'
+            Authorization: `Bearer ${oldConnection.localKey}`, 'X-Session-ID': sessionId,
+            'Content-Type': 'application/json', ...headers
           },
           body: JSON.stringify({ model: 'naparnik', messages: [{ role: 'user', content: 'Вопрос' }] })
         });
@@ -106,7 +108,7 @@ test('Настройки диалога сохраняются и применя
   assert.equal(saved.status, 200);
   assert.deepEqual(await saved.json(), chosen);
   assert.deepEqual(connection(), { ...oldConnection, conversationDefaults: chosen });
-  await app.send('existing');
+  await app.send('existing', { 'x-relay-input': 'delta' });
   await app.send('new');
   assert.deepEqual(creations, [initial, chosen]);
   assert.deepEqual(messagePaths, ['/conversations/dialog-1/messages', '/conversations/dialog-1/messages',
@@ -124,4 +126,25 @@ test('Настройки диалога сохраняются и применя
   assert.deepEqual(await custom.json(), customLanguage);
   await restarted.send('custom-language');
   assert.deepEqual(creations, [initial, chosen, chosen, customLanguage]);
+
+  const firstWindow = await (await restarted.get()).json();
+  const secondWindow = await (await restarted.get()).json();
+  assert.deepEqual(firstWindow, secondWindow);
+  const nextUi = await restarted.patch({ ui_language: 'ru' });
+  assert.equal(nextUi.status, 200);
+  assert.deepEqual(await nextUi.json(), { ...firstWindow, ui_language: 'ru' });
+  const nextScript = await restarted.patch({ script_language: 'ru' });
+  assert.equal(nextScript.status, 200);
+  const combined = { ...secondWindow, ui_language: 'ru', script_language: 'ru' };
+  assert.deepEqual(await nextScript.json(), combined);
+  assert.deepEqual(connection().conversationDefaults, combined);
+
+  for (const invalid of [{}, { other_language: 'ru' }, { programming_language: null }]) {
+    const response = await restarted.patch(invalid);
+    assert.equal(response.status, 400);
+    await response.json();
+  }
+  assert.deepEqual(await (await restarted.get()).json(), combined);
+  await restarted.send('from-both-windows');
+  assert.deepEqual(creations.at(-1), combined);
 });

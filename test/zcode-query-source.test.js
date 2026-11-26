@@ -43,9 +43,9 @@ async function fixture(t) {
   const base = await listen(t, createServer({ upstream, profileDir, monitor,
     connection: { admin: 'admin-fixture', localKey: 'local-fixture', upstream: 'key-fixture' }
   }));
-  const post = async (path, input, source) => {
+  const post = async (path, input, source, extraHeaders) => {
     const headers = { Authorization: 'Bearer local-fixture', 'Content-Type': 'application/json',
-      'x-session-id': sessionId, 'x-zcode-session-type': 'main' };
+      'x-session-id': sessionId, 'x-zcode-session-type': 'main', ...extraHeaders };
     if (source !== undefined) headers['x-zcode-query-source'] = source;
     const response = await fetch(base + '/v1/' + path, {
       method: 'POST', headers, body: JSON.stringify({ model: 'naparnik', ...input })
@@ -109,7 +109,7 @@ test('Заголовок ZCode не меняет маршрутизацию Anth
   const { post, posts } = await fixture(t);
   const source = 'auxiliary_fixture';
   await post('messages', { messages: [user('Первый вопрос')] }, source);
-  await post('messages', { messages: [user('Следующий вопрос')] }, source);
+  await post('messages', { messages: [user('Следующий вопрос')] }, source, { 'x-relay-input': 'delta' });
   assert.equal(posts[1].path, posts[0].path);
   assert.equal(posts[1].body.parent_uuid, 'answer-1');
 });
