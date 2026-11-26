@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f7f3" />
+    <title>Трассировка · Напарник</title>
+    <link rel="icon" href="/icon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/trace.js"></script>
+  </head>
+  <body class="trace-page">
+    <main class="trace-shell">
+      <header class="panel-heading trace-heading">
+        <h1>Трассировка</h1>
+        <button id="trace-refresh" class="secondary" type="button">Обновить</button>
+      </header>
+      <div class="trace-layout">
+        <section class="trace-sidebar" aria-labelledby="sessions-title">
+          <h2 id="sessions-title">Сессии</h2>
+          <ul id="trace-sessions" class="trace-sessions"></ul>
+          <p id="session-feedback" class="panel-feedback" role="status">Загружаем сессии…</p>
+        </section>
+        <section class="trace-workspace" aria-labelledby="exchange-title">
+          <header class="trace-session-heading">
+            <div>
+              <h2 id="exchange-title">Обмен</h2>
+              <p id="trace-feedback" class="panel-feedback" role="status">Выберите сессию.</p>
+            </div>
+            <label class="trace-sync" id="trace-sync-control" hidden>
+              <input type="checkbox" id="trace-sync" checked />
+              Связать прокрутку
+            </label>
+          </header>
+          <div class="trace-comparison" id="trace-columns" hidden>
+            <h3 class="trace-client-heading" id="trace-client-title">Агент</h3>
+            <h3 class="trace-upstream-heading" id="trace-upstream-title">Напарник</h3>
+            <div class="trace-scroll trace-client-scroll" id="trace-client-scroll" tabindex="0" role="region" aria-labelledby="trace-client-title">
+              <div id="trace-client-packets"></div>
+            </div>
+            <div class="trace-lines" id="trace-lines" aria-hidden="true"></div>
+            <div class="trace-scroll trace-upstream-scroll" id="trace-upstream-scroll" tabindex="0" role="region" aria-labelledby="trace-upstream-title">
+              <div id="trace-upstream-packets"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

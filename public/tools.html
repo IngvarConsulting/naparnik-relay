@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f7f3" />
+    <title>Настройки · Напарник</title>
+    <link rel="icon" href="/icon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/tools.js"></script>
+  </head>
+  <body>
+    <main class="tools-page">
+      <h1>Настройки</h1>
+      <section class="settings-section" aria-labelledby="defaults-title">
+        <h2 id="defaults-title">Значения для новых диалогов</h2>
+        <form id="conversation-defaults" aria-labelledby="defaults-title">
+          <div class="defaults-row">
+            <span id="ui-language-label" class="defaults-label">Язык интерфейса</span>
+            <div class="language-options" role="radiogroup" aria-labelledby="ui-language-label">
+              <label><input type="radio" name="ui_language" value="ru" disabled /><span>Русский</span></label>
+              <label><input type="radio" name="ui_language" value="en" disabled /><span lang="en">English</span></label>
+            </div>
+          </div>
+          <div class="defaults-row">
+            <span id="programming-language-label" class="defaults-label">Язык программирования</span>
+            <div class="language-options" role="radiogroup" aria-labelledby="programming-language-label">
+              <label><input type="radio" name="programming_language" value="1c" disabled /><span>1С</span></label>
+              <label><input type="radio" name="programming_language" value="java" disabled /><span>Java</span></label>
+              <label><input type="radio" name="programming_language" value="other" disabled /><span>Другой</span></label>
+            </div>
+          </div>
+          <label id="programming-custom" class="defaults-row" hidden>
+            <span class="defaults-label">Код языка</span>
+            <input id="programming-code" type="text" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Например, python" disabled />
+          </label>
+          <div class="defaults-row">
+            <span id="script-language-label" class="defaults-label">Язык комментариев</span>
+            <div class="language-options" role="radiogroup" aria-labelledby="script-language-label">
+              <label><input type="radio" name="script_language" value="ru" disabled /><span>Русский</span></label>
+              <label><input type="radio" name="script_language" value="en" disabled /><span lang="en">English</span></label>
+            </div>
+          </div>
+        </form>
+        <p id="defaults-feedback" class="panel-feedback" role="status">Загружаем настройки…</p>
+        <button id="defaults-retry" class="secondary" type="button" hidden>Повторить загрузку</button>
+      </section>
+      <section class="settings-section" aria-labelledby="tools-heading">
+        <h2 id="tools-heading">Серверные инструменты</h2>
+        <ul id="tool-list" class="tool-list" aria-labelledby="tools-heading"></ul>
+        <p id="tool-feedback" class="panel-feedback" role="status">Загружаем инструменты…</p>
+        <button id="tool-retry" class="secondary" type="button" hidden>Повторить загрузку</button>
+      </section>
+    </main>
+  </body>
+</html>

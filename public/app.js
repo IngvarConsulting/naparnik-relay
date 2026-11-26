@@ -1,4 +1,4 @@
-import { startToolMonitor } from './tools.js';
+import { panelRequest as api } from './panel.js';
 const $ = (id) => document.getElementById(id);
 let state,
   profile = 'zcode',
@@ -9,21 +9,6 @@ function toast(message) {
   clearTimeout(toastTimer);
   $('toast').textContent = message;
   toastTimer = setTimeout(() => ($('toast').textContent = ''), 2500);
-}
-async function api(path, method = 'GET', data) {
-  let res;
-  try {
-    res = await fetch('/panel/' + path, {
-      method,
-      headers: { 'X-Relay-Panel': '1', 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-  } catch {
-    throw Error('Нет связи со шлюзом. Запустите программу ещё раз.');
-  }
-  const value = await res.json();
-  if (!res.ok) throw Error(value.error?.message || 'Ошибка подключения.');
-  return value;
 }
 function pick(p) {
   profile = p;
@@ -97,9 +82,7 @@ for (const button of document.querySelectorAll('.copy'))
   };
 function showPage() {
   const auth = location.hash === '#account' && Boolean(state);
-  const tools = location.hash === '#tools' && Boolean(state);
-  $('tools').hidden = !tools;
-  $('home').hidden = auth || tools;
+  $('home').hidden = auth;
   $('auth').hidden = !auth;
   $('quota').open = false;
   $('account').reset();
@@ -112,8 +95,6 @@ function showPage() {
     $('connect').textContent = state.configured ? 'Заменить ключ' : 'Подключить';
     if (!state.configured || state.problem?.status === 401) $('secret').focus();
     else $('auth-title').focus();
-  } else if (tools) {
-    $('tools-title').focus();
   } else {
     $('manage').focus({preventScroll:true});
   }
@@ -186,7 +167,6 @@ try {
     history.replaceState(null, '', location.pathname);
     await api('session', 'POST', { token });
   }
-  startToolMonitor(api);
   await update(true);
   setInterval(() => {
     if (!document.hidden && $('auth').hidden)

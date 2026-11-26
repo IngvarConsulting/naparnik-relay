@@ -25,13 +25,28 @@ export function save(value, create = false) {
   writePrivateJSON(file, value, create);
 }
 
-function isCursor(value) {
+function isCursor(value, allowRoot = false) {
   return typeof value?.conversation === 'string' && value.conversation &&
-    typeof value.parent === 'string' && value.parent &&
+    ((typeof value.parent === 'string' && value.parent) || (allowRoot && value.parent === null)) &&
     Array.isArray(value.clientNames) && value.clientNames.every(name => typeof name === 'string') &&
     Array.isArray(value.serverDecisions) && value.serverDecisions.every(
-      item => typeof item?.tool_call_id === 'string' && item.status === 'accepted' && item.content === null
+      item => typeof item?.tool_call_id === 'string' && ['accepted', 'rejected'].includes(item.status) &&
+        item.content === null && (item.name === undefined || typeof item.name === 'string')
     );
+}
+
+const isDigest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+function isRecovery(value) {
+  return isDigest(value?.fingerprint) && isCursor(value.origin, true) &&
+    value.base?.conversation === value.origin.conversation &&
+    (value.base.parent === null || typeof value.base.parent === 'string') &&
+    Array.isArray(value.posts) && value.posts.length > 0 && value.posts.every(post =>
+      post?.sent === true && typeof post.complete === 'boolean' && typeof post.noGenerate === 'boolean' &&
+      typeof post.unreadEvent === 'boolean' &&
+      ['user', 'tool'].includes(post.role) && (post.parent === null || typeof post.parent === 'string') &&
+      isDigest(post.signature) && isDigest(post.content) &&
+      ['toolIds', 'acks', 'finalIds', 'drafts', 'running'].every(field =>
+        Array.isArray(post[field]) && post[field].every(item => typeof item === 'string')));
 }
 
 export class SessionBindings {
@@ -49,10 +64,10 @@ export class SessionBindings {
   get(id) {
     try {
       const state = JSON.parse(readFileSync(this.path(id), 'utf8'));
-      if (!isCursor(state) ||
+      if (!isCursor(state, Boolean(state?.recoveries?.length)) ||
+          (state.recoveries !== undefined && (!Array.isArray(state.recoveries) || !state.recoveries.every(isRecovery))) ||
           (state.checkpoints !== undefined && (!Array.isArray(state.checkpoints) || !state.checkpoints.every(
-            checkpoint => isCursor(checkpoint) && typeof checkpoint.fingerprint === 'string' &&
-              /^[0-9a-f]{64}$/.test(checkpoint.fingerprint)
+            checkpoint => isCursor(checkpoint) && isDigest(checkpoint.fingerprint)
           )))) throw new Error('Повреждена сохранённая привязка диалога.');
       return state;
     } catch (error) {
@@ -61,9 +76,9 @@ export class SessionBindings {
     }
   }
 
-  set(id, { conversation, parent, clientNames, serverDecisions, checkpoints }) {
+  set(id, { conversation, parent, clientNames, serverDecisions, checkpoints, recoveries }) {
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    writePrivateJSON(this.path(id), { conversation, parent, clientNames: [...clientNames], serverDecisions, checkpoints });
+    writePrivateJSON(this.path(id), { conversation, parent, clientNames: [...clientNames], serverDecisions, checkpoints, recoveries });
   }
 }
 

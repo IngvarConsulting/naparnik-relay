@@ -10,6 +10,7 @@ import { createServer } from '../server.js';
 test('Оба клиента, ключи, история, поток и ошибки', async (t) => {
   const received = [],
     accounts = [],
+    historyRequests = [],
     titleRequests = [];
   let id = 0,
     breaking = null,
@@ -26,6 +27,23 @@ test('Оба клиента, ключи, история, поток и ошиб�
     if (req.url === '/conversations') {
       res.end(JSON.stringify({ uuid: 'chat-' + ++id }));
       return;
+    }
+    if (req.method === 'GET' && /^\/conversations\/chat-\d+$/.test(req.url)) {
+      historyRequests.push(req.url);
+      const { body } = received.at(-1);
+      const create_time = '2026-08-25T10:00:00Z';
+      return res.end(JSON.stringify({
+        uuid: req.url.split('/').at(-1),
+        messages: [
+          { uuid: 'echo', parent_uuid: body.parent_uuid, role: 'user', content: body.content, create_time },
+          {
+            uuid: 'answer', parent_uuid: 'echo', role: 'assistant', create_time,
+            content: {
+              tool_calls: [{ id: 'call-1', function: { name: body.tools[0].name, arguments: toolArguments } }]
+            }
+          }
+        ]
+      }));
     }
     if (req.url.includes('/context_tokens?branch=')) {
       assert.match(req.url, /branch=answer$/);
@@ -178,16 +196,25 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.equal(models.data[0].context_length, 384000);
   assert.equal(received.at(-1).body.role, 'tool');
   assert.equal(received.at(-1).url, received.at(-2).url);
-  const inventory = await (await request('/panel/tools', undefined, header)).json();
+  const inventory = await (await request('/panel/tool-history', undefined, header)).json();
   assert.deepEqual(inventory.sessions.map(s => s.tools), [['lookup'], ['lookup']]);
   assert.equal((await request('/panel/tools', undefined, oa)).status, 403);
-  for (const [path, headers] of [['messages', an], ['chat/completions', oa]]) {
+  assert.equal((await request('/panel/trace', undefined, oa)).status, 403);
+  const options = await (await request('/panel/tools', undefined, header)).json();
+  assert.deepEqual(options.tools.filter(tool => !tool.enabled).map(tool => tool.id), ['mcp__web__fetch']);
+  for (const [path, headers, enabled] of [['messages', an, false], ['chat/completions', oa, true]]) {
+    if (enabled) {
+      const result = await request('/panel/tools', { id: 'mcp__web__fetch', enabled }, header, 'PUT');
+      assert.equal(result.status, 200);
+      assert.equal((await result.json()).tools.find(tool => tool.id === 'mcp__web__fetch').enabled, true);
+      assert.equal(accounts.at(-1).serverTools['mcp__web__fetch'], true);
+    }
     const final = post(path, {messages:[{role:'user', content:'permission'}], stream:true}, headers);
     assert.match(await (await final).text(), /Готово/);
     assert.equal(received.at(-1).body.parent_uuid, 'permission-request');
-    assert.deepEqual(received.at(-1).body.content, [{tool_call_id:'web', status:'accepted', content:null}]);
+    assert.deepEqual(received.at(-1).body.content, [{tool_call_id:'web', status: enabled ? 'accepted' : 'rejected', content:null}]);
   }
-  const log = await (await request('/panel/tools', undefined, header)).json();
+  const log = await (await request('/panel/tool-history', undefined, header)).json();
   assert.deepEqual(log.history.map(row => [row.protocol, row.name]), [
     ['OpenAI','mcp__web__fetch'], ['Anthropic','mcp__web__fetch']
   ]);
@@ -237,7 +264,7 @@ test('Оба клиента, ключи, история, поток и ошиб�
   assert.equal(received.at(-1).body.parent_uuid, 'answer');
   assert.equal(titleRequests.length, 2);
   assert.equal((await post('chat/completions', {messages: [{role:'user', content:'now empty'}], tools: []}, sessionHeaders)).status, 200);
-  const grouped = await (await request('/panel/tools', undefined, header)).json();
+  const grouped = await (await request('/panel/tool-history', undefined, header)).json();
   assert.equal(grouped.sessions.length, 5);
   assert.deepEqual(grouped.sessions.find(s => s.id === 'chat-A' && s.protocol === 'OpenAI').tools, []);
   const harness = grouped.sessions.find(s => s.id === 'chat-A' && s.protocol === 'Anthropic');
@@ -248,6 +275,27 @@ test('Оба клиента, ключи, история, поток и ошиб�
     assert.deepEqual(session.history.map(h => [h.protocol, h.name]), [[session.protocol, 'mcp__web__fetch']]);
   }
   assert.deepEqual(grouped.history, log.history);
+  const traceIndex = await (await request('/panel/trace', undefined, header)).json();
+  for (const [protocol, id, toolScope] of [
+    ['Anthropic', 'chat-A', 'server'], ['OpenAI', 'chat-A', 'server'],
+    ['Anthropic', 'deepseek-tools', 'client'], ['OpenAI', 'zcode-tools', 'client']
+  ]) {
+    const session = encodeURIComponent(JSON.stringify([protocol, id]));
+    const { exchanges } = await (await request('/panel/trace?session=' + session, undefined, header)).json();
+    const calls = exchanges.flatMap(exchange => exchange.upstream).filter(packet => packet.body?.content?.tool_calls?.length);
+    assert.ok(calls.length);
+    assert.ok(calls.every(packet => packet.toolScope === toolScope));
+  }
+  const traceSession = traceIndex.sessions.find(session => session.id === JSON.stringify(['Anthropic', 'chat-A']));
+  assert.equal(traceSession.title, 'A generated title');
+  const trace = await (await request('/panel/trace?session=' + encodeURIComponent(traceSession.id), undefined, header)).json();
+  const titleTrace = trace.exchanges.find(exchange => exchange.upstream.some(packet => packet.path?.endsWith('/title')));
+  const titleRequest = titleTrace.upstream.find(packet => packet.path?.endsWith('/title'));
+  const titleResult = titleTrace.upstream.find(packet => packet.call === titleRequest.id && packet.kind === 'response');
+  assert.equal(titleRequest.source, titleTrace.client[0].id);
+  assert.equal(titleResult.body.title, 'A generated title');
+  assert.ok(titleTrace.client.some(packet => packet.source === titleResult.id && packet.body?.delta?.text === 'A generated title'));
+  assert.doesNotMatch(JSON.stringify(trace), /real-fixture|local-fixture|panel-fixture/);
   missingContext = true;
   const unmeasured = await (await post('chat/completions', { messages, tools }, zcode)).json();
   assert.equal(unmeasured.usage.total_tokens, 100);
@@ -280,8 +328,11 @@ test('Оба клиента, ключи, история, поток и ошиб�
   toolArguments = '[]';
   const malformed = await post('messages', { messages, tools: aTools }, malformedSession);
   assert.equal(malformed.status, 502);
+  const originalPosts = received.length;
   toolArguments = '{ "x" : 1 }';
   assert.equal((await post('messages', { messages, tools: aTools }, malformedSession)).status, 200);
+  assert.equal(received.length, originalPosts);
+  assert.deepEqual(historyRequests, [received.at(-1).url.replace(/\/messages$/, '')]);
   assert.equal(received.at(-1).body.parent_uuid, null);
   const disconnected = await (await request('/panel/account', undefined, header, 'DELETE')).json();
   assert.equal(disconnected.configured, false);

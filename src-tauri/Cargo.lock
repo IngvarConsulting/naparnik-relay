@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "naparnik-relay"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "serde_json",
  "tauri",

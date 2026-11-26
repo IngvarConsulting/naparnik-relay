@@ -1,7 +1,11 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
+import { currentTrace } from './trace-store.js';
 
 export const MODEL = 'naparnik';
+export const defaultConversationSettings = Object.freeze({
+  ui_language: 'ru', programming_language: '1c', script_language: 'ru'
+});
 export class Fault extends Error {
   constructor(status, code, message) {
     super(message);
@@ -171,17 +175,36 @@ export function normalize(body, anthropic, harnessSessionId) {
   return { messages, tools, ...(isHarnessTitleRequest(body, anthropic && harnessSessionId) && { titleRequest: true }) };
 }
 
-async function* packets(stream, signal) {
+const responseTraces = new WeakMap();
+const packetSources = new WeakMap();
+
+async function* packets(stream, signal, trace, clientToolNames) {
   const decoder = new TextDecoder();
   let buffer = '',
     lines = [];
   function parse() {
     const s = lines.join('\n');
     lines = [];
-    if (!s || s === '[DONE]') return;
+    if (!s) return;
+    if (s === '[DONE]') {
+      trace?.exchange.record('upstream', { kind: 'sse', body: s, call: trace.call });
+      return;
+    }
     try {
-      return JSON.parse(s);
+      const packet = JSON.parse(s);
+      if (trace) {
+        const calls = packet?.finished === true && packet.role === 'assistant' ? packet.content?.tool_calls : undefined;
+        let toolScope;
+        if (clientToolNames && Array.isArray(calls) && calls.length && calls.every(call => call?.function?.name)) {
+          const clientCount = calls.filter(call => clientToolNames.has(call.function.name)).length;
+          toolScope = clientCount === calls.length ? 'client' : clientCount ? 'mixed' : 'server';
+        }
+        const id = trace.exchange.record('upstream', { kind: 'sse', body: packet, call: trace.call, toolScope });
+        if (isObject(packet) && id) packetSources.set(packet, id);
+      }
+      return packet;
     } catch {
+      trace?.exchange.record('upstream', { kind: 'error', body: s, call: trace.call });
       throw new Fault(502, 'bad_stream', 'Напарник вернул повреждённое событие.');
     }
   }
@@ -201,11 +224,13 @@ async function* packets(stream, signal) {
   } catch (error) {
     signal.throwIfAborted();
     if (error instanceof Fault) throw error;
-    throw new Fault(502, 'incomplete_stream', 'Поток Напарника прерван при передаче.');
+    throw Object.assign(new Fault(502, 'incomplete_stream', 'Поток Напарника прерван при передаче.'),
+      { unreadEvent: Boolean(lines.length || (buffer && !buffer.startsWith(':'))) });
   }
   buffer += decoder.decode();
   if (lines.length || (buffer && !buffer.startsWith(':')))
-    throw new Fault(502, 'incomplete_stream', 'Поток Напарника завершился посреди события.');
+    throw Object.assign(new Fault(502, 'incomplete_stream', 'Поток Напарника завершился посреди события.'),
+      { unreadEvent: true });
 }
 const errorMessages = {
   invalid_token: 'Напарник отклонил API-ключ.',
@@ -276,6 +301,80 @@ function sessionCheckpoint(fingerprint, { conversation, parent, serverDecisions,
   return { fingerprint, conversation, parent, serverDecisions, clientNames: [...clientNames] };
 }
 
+function toolDecision(tool_call_id, enabled) {
+  return { tool_call_id, status: enabled ? 'accepted' : 'rejected', content: null };
+}
+
+const recoveryPending = () => new Fault(409, 'recovery_pending',
+  'Напарник мог сохранить сообщение. Повторите запрос, чтобы проверить наличие ответа.');
+const recoveryUnavailable = () => new Fault(503, 'recovery_unavailable',
+  'Не удалось сверить сообщение с историей Напарника. Повторите запрос позже.');
+const digest = (key, value) => createHmac('sha256', key).update(stableJson(value)).digest('hex');
+const inputDigest = (key, messages) => digest(key, messages.filter(message =>
+  !['system', 'developer'].includes(message.role)));
+const toolResults = content => Array.isArray(content) ? content : [content];
+const interrupted = error => ['incomplete_stream', 'bad_stream', 'connection_error'].includes(error?.code);
+
+function savedBranch(key, messages, attempt) {
+  const byId = new Map();
+  const children = new Map();
+  for (const message of messages) {
+    if (!message || typeof message.uuid !== 'string' || !message.uuid || byId.has(message.uuid) ||
+        !(message.parent_uuid === null || typeof message.parent_uuid === 'string')) throw recoveryUnavailable();
+    byId.set(message.uuid, message);
+    const siblings = children.get(message.parent_uuid) ?? [];
+    siblings.push(message);
+    children.set(message.parent_uuid, siblings);
+  }
+  if (attempt.parent !== null && !byId.has(attempt.parent)) throw recoveryPending();
+  const siblings = children.get(attempt.parent) ?? [];
+  let roots;
+  if (attempt.role === 'user') {
+    roots = attempt.acks.length ? attempt.acks.map(id => byId.get(id)) : siblings.filter(
+      row => row.role === 'user' && typeof row.content === 'string' && digest(key, row.content) === attempt.content
+    );
+  } else {
+    roots = siblings.filter(row => row.role === 'tool' && toolResults(row.content).some(
+      result => attempt.toolIds.includes(result?.tool_call_id)
+    ));
+    const ids = roots.flatMap(row => toolResults(row.content).map(result => result?.tool_call_id));
+    if (roots.length && (ids.length !== attempt.toolIds.length || new Set(ids).size !== ids.length ||
+        !attempt.toolIds.every(id => ids.includes(id)))) throw recoveryPending();
+  }
+  if (!roots.length) {
+    if (attempt.acks.length || attempt.finalIds.length) throw recoveryPending();
+    return null;
+  }
+  if (roots.some(row => row?.role !== attempt.role || row.parent_uuid !== attempt.parent) ||
+      (attempt.role === 'user' && roots.length !== 1) ||
+      attempt.acks.some(id => !roots.some(row => row.uuid === id))) throw recoveryPending();
+  if (attempt.role === 'user' && attempt.parent !== null && !attempt.acks.length &&
+      !attempt.finalIds.length && !attempt.drafts.length) throw recoveryPending();
+
+  const branch = [...roots];
+  const seen = new Set(roots.map(row => row.uuid));
+  let frontier = roots;
+  while (!attempt.complete && !attempt.noGenerate) {
+    const next = frontier.flatMap(row => children.get(row.uuid) ?? []).filter(row => row.role !== 'user');
+    if (!next.length) break;
+    if ((next.length > 1 && !next.every(row => row.role === 'tool')) || next.some(row => seen.has(row.uuid)))
+      throw recoveryPending();
+    for (const row of next) seen.add(row.uuid);
+    branch.push(...next);
+    frontier = next;
+  }
+  if (attempt.complete) {
+    return [...roots, ...attempt.finalIds.filter(id => !seen.has(id)).map(id => {
+      const row = byId.get(id);
+      if (!row || row.role === 'user' || !seen.has(row.parent_uuid)) throw recoveryPending();
+      seen.add(id);
+      return row;
+    })];
+  }
+  if (attempt.finalIds.some(id => !seen.has(id))) throw recoveryPending();
+  return branch;
+}
+
 const longOperationMs = 600_000;
 const maxCheckpoints = 128;
 const maxToolCallbacks = 128;
@@ -283,11 +382,13 @@ const relayToolPrefix = 'call_relay_';
 const noTitleContext = () => new Fault(424, 'insufficient_context', 'Для названия нужен ответ в этом диалоге.');
 
 export class Bridge {
-  constructor(base = 'https://code.1c.ai/public/v1', sessions = new Map(), conversationQueue = new Map()) {
+  constructor(base = 'https://code.1c.ai/public/v1', sessions = new Map(), conversationQueue = new Map(),
+    serverToolEnabled = () => true) {
     this.base = base;
     this.sessions = sessions;
     this.pending = new Map();
     this.conversationQueue = conversationQueue;
+    this.serverToolEnabled = serverToolEnabled;
     this.toolCallbacks = new Map();
     this.sessionEvents = new EventEmitter().setMaxListeners(0);
   }
@@ -296,9 +397,15 @@ export class Bridge {
     timeoutMs = stream ? longOperationMs : 20_000
   ) {
     const timeout = AbortSignal.timeout(timeoutMs);
+    const exchange = currentTrace();
+    let call;
     let response;
     try {
-      response = await fetch(this.base + path, {
+      const url = new URL(this.base + path);
+      call = exchange?.record('upstream', {
+        kind: 'request', method, path: url.pathname + url.search, body, source: exchange.requestId
+      });
+      response = await fetch(url, {
         method,
         redirect: 'error',
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
@@ -310,7 +417,27 @@ export class Bridge {
         body: JSON.stringify(body)
       });
     } catch {
+      exchange?.record('upstream', { kind: 'error', call, body: 'Нет связи с Напарником.' });
       throw new Fault(503, 'connection_error', 'Нет связи с Напарником. Проверьте сеть и повторите запрос.');
+    }
+    if (exchange) {
+      const trace = { exchange, call };
+      responseTraces.set(response, trace);
+      if (stream && response.ok) {
+        trace.response = exchange.record('upstream', { kind: 'response', call, status: response.status });
+      } else {
+        const json = response.json.bind(response);
+        response.json = async () => {
+          try {
+            const data = await json();
+            trace.response = exchange.record('upstream', { kind: 'response', call, status: response.status, body: data });
+            return data;
+          } catch (error) {
+            exchange.record('upstream', { kind: 'error', call, status: response.status, body: 'Не удалось прочитать ответ JSON.' });
+            throw error;
+          }
+        };
+      }
     }
     if (!response.ok) throw upstreamFault(response.status, await response.json().catch(() => ({})));
     return response;
@@ -418,7 +545,10 @@ export class Bridge {
       const result = await response.json().catch(() => null);
       if (typeof result?.title !== 'string' || !result.title.trim())
         throw new Fault(502, 'bad_title', 'Напарник не вернул название диалога.');
-      return assistant(result.title.trim());
+      const title = assistant(result.title.trim());
+      const source = responseTraces.get(response)?.response;
+      if (source) packetSources.set(title, source);
+      return title;
     }
   }
 
@@ -427,7 +557,7 @@ export class Bridge {
     const id = sessionId ? JSON.stringify([protocol, sessionId]) : null;
     if (titleRequest) {
       const reply = await this.generateTitle(key, id, signal);
-      onPart(reply);
+      await onPart(reply, signal, packetSources.get(reply));
       return reply;
     }
     if (!id) return this.generateWithoutSession(key, payload, signal, onPart, onServerCall, onMetrics);
@@ -438,9 +568,9 @@ export class Bridge {
       const lastAssistant = messages.findLastIndex(message => message.role === 'assistant');
       const seed = lastAssistant < 0 ? checkpoints.at(-1)?.fingerprint : undefined;
       const fingerprints = id ? transcriptFingerprints(key, messages, seed) : [];
-      let previous = stored;
+      let previous = stored?.parent ? stored : undefined;
       let from = 0;
-      if (stored && lastAssistant >= 0) {
+      if (previous && lastAssistant >= 0) {
         if (stored.checkpoints === undefined) {
           // The old profile has a cursor but no fingerprints. Learn its history from the first replay.
           checkpoints.push(sessionCheckpoint(fingerprints[lastAssistant], stored));
@@ -453,14 +583,32 @@ export class Bridge {
           from = index + 1;
         }
       }
-      const { reply, state } = await this.generateTurn(
-        key, { ...payload, messages: messages.slice(from) }, previous, signal, onPart, onServerCall, onMetrics
-      );
+      const input = messages.slice(from);
+      const recoveries = stored?.recoveries ?? [];
+      const fingerprint = recoveries.length ? inputDigest(key, input) : undefined;
+      const reference = previous ?? (stored?.parent === null ? stored : undefined);
+      const candidates = recoveries.filter(item => reference
+        ? item.base.conversation === reference.conversation && item.base.parent === reference.parent
+        : item.fingerprint === fingerprint);
+      if (!reference && candidates.length > 1) throw recoveryPending();
+      const recovery = candidates.find(item => item.fingerprint === fingerprint) ?? candidates[0];
+      const retry = Boolean(recovery && recovery.fingerprint === fingerprint);
+      const otherRecoveries = recoveries.filter(item => item !== recovery);
+      const onInterrupted = (origin, posts) => this.sessions.set(id, {
+        ...(stored ?? origin), recoveries: [...otherRecoveries, {
+          fingerprint: fingerprint ?? inputDigest(key, input), origin, posts,
+          base: recovery?.base ?? { conversation: origin.conversation, parent: reference?.parent ?? null }
+        }]
+      });
+      const { reply, state } = await this.generateTurn(key, {
+        ...payload, messages: input, recovery, retry, onInterrupted
+      }, previous, signal, onPart, onServerCall, onMetrics);
       if (id) {
         const [fingerprint] = transcriptFingerprints(key, [reply], fingerprints.at(-1));
         const checkpoint = sessionCheckpoint(fingerprint, state);
         const retained = checkpoints.filter(saved => saved.fingerprint !== fingerprint).slice(1 - maxCheckpoints);
         state.checkpoints = [...retained, checkpoint];
+        if (otherRecoveries.length) state.recoveries = otherRecoveries;
         this.sessions.set(id, state);
         this.sessionEvents.emit('saved:' + id);
       }
@@ -525,13 +673,15 @@ export class Bridge {
 
   async generateTurn(key, payload, previous, signal, onPart, onServerCall, onMetrics) {
     signal = AbortSignal.any([signal, AbortSignal.timeout(longOperationMs)]);
+    const { recovery, retry, onInterrupted } = payload;
+    if (recovery && (retry || !previous)) previous = recovery.origin;
     let conversation = previous?.conversation;
     if (!conversation) {
       const created = await (
         await this.request(
           key,
           '/conversations',
-          { ui_language: 'ru', programming_language: '1c', script_language: 'ru' },
+          payload.conversationDefaults ?? defaultConversationSettings,
           signal
         )
       ).json();
@@ -540,12 +690,164 @@ export class Bridge {
       conversation = created.uuid;
     }
     payload.onConversation?.(conversation);
-    return this.inConversation(conversation, signal, () =>
-      this.generateInConversation(key, payload, previous, conversation, signal, onPart, onServerCall, onMetrics));
+    return this.inConversation(conversation, signal, async () => {
+      if (recovery && !retry) {
+        // Resolve the outstanding write before a different message can extend the branch.
+        for (const attempt of [...recovery.posts].reverse()) {
+          const branch = await this.readSavedBranch(key, conversation, signal, attempt);
+          if (!branch) continue;
+          const last = branch.at(-1);
+          if (last.role === 'tool' || last.content?.tool_calls?.length || payload.messages[0]?.role === 'tool')
+            throw recoveryPending();
+          previous = { ...recovery.origin, parent: last.uuid, serverDecisions: [] };
+          const prefix = payload.messages.findIndex((_message, index) =>
+            inputDigest(key, payload.messages.slice(0, index + 1)) === recovery.fingerprint);
+          if (prefix >= 0) payload = { ...payload, messages: payload.messages.slice(prefix + 1) };
+          break;
+        }
+      }
+      const origin = {
+        conversation, parent: previous?.parent ?? null, serverDecisions: previous?.serverDecisions ?? [],
+        clientNames: [...(previous?.clientNames ?? [])]
+      };
+      const posts = retry ? structuredClone(recovery.posts) : [];
+      try {
+        return await this.generateInConversation(key, payload, previous, conversation, signal,
+          onPart, onServerCall, onMetrics, posts);
+      } catch (error) {
+        const sent = posts.filter(post => post.sent);
+        if (sent.length) onInterrupted?.(origin, sent);
+        throw error;
+      }
+    });
+  }
+
+  async readSavedBranch(key, conversation, signal, attempt) {
+    let history, source;
+    try {
+      const response = await this.request(key, '/conversations/' + encodeURIComponent(conversation),
+        undefined, signal, false, 'GET', 5000);
+      history = await response.json();
+      source = responseTraces.get(response)?.response;
+    } catch {
+      signal.throwIfAborted();
+      throw recoveryUnavailable();
+    }
+    if (history?.uuid !== conversation || !Array.isArray(history.messages)) throw recoveryUnavailable();
+    const branch = savedBranch(key, history.messages, attempt);
+    if (source) for (const row of branch ?? []) packetSources.set(row, source);
+    return branch;
+  }
+
+  async *messagePackets(key, conversation, body, signal, posts, index, clientToolNames) {
+    const signature = digest(key, body);
+    const previous = posts[index];
+    const recovered = async attempt => {
+      const branch = await this.readSavedBranch(key, conversation, signal, attempt);
+      if (!branch) return null;
+      const last = branch.at(-1);
+      const completed = new Set(branch.map(row => row.uuid));
+      const toolIds = new Set(branch.filter(row => row.role === 'tool').flatMap(
+        row => toolResults(row.content).map(result => result?.tool_call_id)
+      ));
+      if (!attempt.complete && !attempt.noGenerate && (last.role !== 'assistant' || !isObject(last.content) ||
+          (!last.content.content && !last.content.tool_calls?.length) ||
+          (attempt.unreadEvent && attempt.finalIds.includes(last.uuid)) ||
+          attempt.drafts.some(id => !completed.has(id)) || attempt.running.some(id => !toolIds.has(id))))
+        throw recoveryPending();
+      return branch.map(row => {
+        const packet = { ...row, finished: true };
+        const source = packetSources.get(row);
+        if (source) packetSources.set(packet, source);
+        return packet;
+      });
+    };
+    if (previous) {
+      if (previous.signature !== signature) throw recoveryPending();
+      const rows = await recovered(previous);
+      if (rows) {
+        yield* rows;
+        previous.complete = true;
+        previous.finalIds = rows.map(row => row.uuid);
+        return;
+      }
+    }
+
+    const attempt = posts[index] = {
+      signature, role: body.role, parent: body.parent_uuid, noGenerate: body.no_generate,
+      content: digest(key, body.content), toolIds: body.role === 'tool' ? body.content.map(item => item.tool_call_id) : [],
+      acks: [], finalIds: [], drafts: [], running: [], unreadEvent: false, sent: false, complete: false
+    };
+    const drafts = new Set();
+    const running = new Set();
+    const finalizedAnswers = new Map();
+    let answered = false;
+    try {
+      const response = await this.request(key, '/conversations/' + encodeURIComponent(conversation) + '/messages',
+        body, signal, true);
+      attempt.sent = true;
+      for await (const packet of packets(response.body, signal, responseTraces.get(response), clientToolNames)) {
+        if (packet.error_type || packet.error)
+          throw upstreamFault(upstreamErrorStatuses.get(packet.error_type) ?? 502, packet);
+        if (!packet.uuid) {
+          const id = packet.content_delta?.tool_call_id;
+          if (!packet.finished && typeof id === 'string' && id) running.add(id);
+        } else if (!packet.finished) {
+          if (packet.content_delta && (packet.role == null || packet.role === 'assistant')) drafts.add(packet.uuid);
+        } else {
+          attempt.finalIds.push(packet.uuid);
+          if (!answered && packet.role === body.role && (body.role === 'user' ||
+              toolResults(packet.content).some(result => attempt.toolIds.includes(
+                result?.tool_call_id ?? packet.details?.tool_call_id)))) attempt.acks.push(packet.uuid);
+          if (packet.role === 'tool') {
+            for (const result of toolResults(packet.content)) running.delete(result?.tool_call_id ?? packet.details?.tool_call_id);
+          }
+          if (packet.role === 'assistant' && packet.content) {
+            drafts.delete(packet.uuid);
+            answered = true;
+            finalizedAnswers.set(packet.uuid, digest(key, [packet.content.content || '', packet.content.tool_calls ?? []]));
+          }
+        }
+        yield packet;
+      }
+      if (drafts.size || running.size || !attempt.finalIds.length || (!body.no_generate && !answered))
+        throw new Fault(502, 'incomplete_stream', 'Поток Напарника завершился до ответа.');
+      attempt.complete = true;
+    } catch (error) {
+      if (signal.aborted || interrupted(error)) {
+        attempt.sent = true;
+        attempt.drafts = [...drafts];
+        attempt.running = [...running];
+        attempt.unreadEvent = error.unreadEvent === true || error.code === 'bad_stream';
+      }
+      if (signal.aborted || !interrupted(error)) throw error;
+      let rows;
+      try {
+        rows = await recovered(attempt);
+      } catch (historyError) {
+        if (historyError.code !== 'recovery_unavailable') throw historyError;
+      }
+      if (!rows) throw error;
+      const delivered = new Set(attempt.finalIds);
+      const lastDelivered = rows.findLastIndex(row => delivered.has(row.uuid));
+      const prefix = rows.slice(0, lastDelivered + 1);
+      if (prefix.some(row => row.role === 'assistant' && (!delivered.has(row.uuid) ||
+          finalizedAnswers.get(row.uuid) !== digest(key, [row.content?.content || '', row.content?.tool_calls ?? []]))) ||
+          prefix.filter(row => delivered.has(row.uuid)).some((row, position) => row.uuid !== attempt.finalIds[position]))
+        throw recoveryPending();
+      yield* rows.slice(lastDelivered + 1);
+      attempt.complete = true;
+      attempt.finalIds = rows.map(row => row.uuid);
+    } finally {
+      if (!attempt.complete) {
+        attempt.drafts = [...drafts];
+        attempt.running = [...running];
+      }
+    }
   }
 
   async generateInConversation(
-    key, { messages, tools, publicCallId }, previous, conversation, signal, onPart, onServerCall, onMetrics
+    key, { messages, tools, publicCallId, onDraft }, previous, conversation, signal, onPart, onServerCall, onMetrics, posts
   ) {
     // The provider reserves tool names (including ZCode's TodoWrite). Give
     // client tools their own wire names and restore them in public responses.
@@ -577,7 +879,8 @@ export class Bridge {
       }
     }
     if (previous?.serverDecisions?.length && turns[0]?.role === 'tool') {
-      turns[0].content.push(...previous.serverDecisions);
+      turns[0].content.push(...previous.serverDecisions.map(({ name, ...decision }) =>
+        name && !posts.length ? toolDecision(decision.tool_call_id, this.serverToolEnabled(name)) : decision));
     }
     const reviewed = new Set((previous?.serverDecisions ?? []).map((item) => item.tool_call_id));
     let serverDecisions = [];
@@ -589,48 +892,24 @@ export class Bridge {
       const last = i === turns.length - 1;
       const body = { ...turn, parent_uuid: turn.parent_uuid ?? parent, no_generate: !last };
       if (turn.role === 'user' && tools.length) body.tools = wireTools;
-      const response = await this.request(
-        key,
-        '/conversations/' + encodeURIComponent(conversation) + '/messages',
-        body,
-        signal,
-        true
-      );
       const serverCalls = new Map();
       const clientCallParents = new Set();
-      const unfinished = new Set();
-      const runningTools = new Set();
-      let received = false,
-        answered = false;
-      for await (const p of packets(response.body, signal)) {
-        if (p.error_type || p.error)
-          throw upstreamFault(
-            upstreamErrorStatuses.get(p.error_type) ?? 502,
-            p
-          );
-        if (!p.uuid) {
-          const id = p.content_delta?.tool_call_id;
-          if (!p.finished && typeof id === 'string' && id) runningTools.add(id);
-          continue;
-        }
+      for await (const p of this.messagePackets(key, conversation, body, signal, posts, i, knownClientNames)) {
+        const source = packetSources.get(p);
+        if (!p.uuid) continue;
         if (!p.finished) {
-          if (p.content_delta && (p.role == null || p.role === 'assistant')) unfinished.add(p.uuid);
+          if (last && p.content_delta && (p.role == null || p.role === 'assistant')) onDraft?.(source);
           continue;
         }
-        received = true;
         parent = p.uuid;
         if (p.role === 'tool') {
-          const results = Array.isArray(p.content) ? p.content : [p.content];
-          for (const result of results) {
+          for (const result of toolResults(p.content)) {
             const id = result?.tool_call_id ?? p.details?.tool_call_id;
-            runningTools.delete(id);
             serverCalls.delete(id);
           }
         }
         if (p.role !== 'assistant' || !p.content) continue;
-        unfinished.delete(p.uuid);
         if (!last) continue;
-        answered = true;
         lastAssistant = p.uuid;
         usage = providerUsage(p.usage);
         onMetrics?.(usage, context);
@@ -642,32 +921,33 @@ export class Bridge {
           }
           if (knownClientNames.has(call.name))
             throw new Fault(502, 'unknown_client_tool', 'Напарник запросил клиентский инструмент вне текущего списка.');
-          serverCalls.set(call.id, p.uuid);
-          onServerCall(call.name);
+          serverCalls.set(call.id, { parent: p.uuid, name: call.name });
+          onServerCall(call.name, source);
         }
-        part.calls = part.calls
-          .filter((c) => wireNames.has(c.name))
-          .map((c) => ({ ...c, id: publicCallId?.(c.id) ?? c.id, name: wireNames.get(c.name) }));
+        part.calls = part.calls.flatMap(call => {
+          if (!wireNames.has(call.name)) return [];
+          return [{ ...call, id: publicCallId?.(call.id) ?? call.id, name: wireNames.get(call.name) }];
+        });
         if (text && part.content) part.content = '\n\n' + part.content;
         text += part.content;
         calls.push(...part.calls);
-        if (part.content || part.calls.length) onPart(part);
+        if (part.content || part.calls.length) {
+          await onPart(part, signal, source);
+        }
       }
-      if (unfinished.size || runningTools.size || !received || (last && !answered))
-        throw new Fault(502, 'incomplete_stream', 'Поток Напарника завершился до ответа.');
-      const toolParents = new Set([...serverCalls.values(), ...clientCallParents]);
+      const toolParents = new Set([...serverCalls.values()].map(call => call.parent).concat([...clientCallParents]));
       if (toolParents.size > 1)
         throw new Fault(502, 'incomplete_stream', 'Напарник оставил незавершённые вызовы инструментов в разных сообщениях.');
       const [toolParent] = toolParents;
       serverDecisions = [];
-      for (const id of serverCalls.keys()) {
+      for (const [id, { name }] of serverCalls) {
         if (reviewed.has(id))
           throw new Fault(502, 'repeated_tool_call', 'Напарник повторил уже рассмотренный вызов инструмента.');
         reviewed.add(id);
-        serverDecisions.push({ tool_call_id: id, status: 'accepted', content: null });
+        serverDecisions.push({ ...toolDecision(id, this.serverToolEnabled(name)), name });
       }
       if (serverDecisions.length && !calls.length) {
-        turns.push({ role: 'tool', content: serverDecisions, parent_uuid: toolParent });
+        turns.push({ role: 'tool', content: serverDecisions.map(({ name, ...decision }) => decision), parent_uuid: toolParent });
       } else if (clientCallParents.size) {
         parent = toolParent;
       }

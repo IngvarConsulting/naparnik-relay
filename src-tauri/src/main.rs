@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     webview::NewWindowResponse,
     AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
 };
@@ -44,6 +44,17 @@ fn show_panel(app: &AppHandle) {
         if reopening {
             let _ = window.eval("window.dispatchEvent(new Event('relay-panel-opened'))");
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hide_dock_when_idle(app: &AppHandle, closing: &str) {
+    if !app
+        .webview_windows()
+        .values()
+        .any(|window| window.label() != closing && window.is_visible().unwrap_or(true))
+    {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     }
 }
 
@@ -102,6 +113,87 @@ fn panel_title(app: &AppHandle) -> String {
     )
 }
 
+#[derive(Clone, Copy)]
+enum AuxiliaryPanel {
+    Tools,
+    Trace,
+}
+
+impl AuxiliaryPanel {
+    fn from_url(url: &tauri::Url) -> Option<Self> {
+        match url.path() {
+            "/tools.html" => Some(Self::Tools),
+            "/trace.html" => Some(Self::Trace),
+            _ => None,
+        }
+    }
+
+    fn open(self, app: &AppHandle, url: tauri::Url) -> tauri::Result<()> {
+        let (label, title, size, minimum) = match self {
+            Self::Tools => (
+                "tools",
+                "Настройки · Naparnik Relay",
+                (500., 600.),
+                (360., 300.),
+            ),
+            Self::Trace => (
+                "trace",
+                "Трассировка · Naparnik Relay",
+                (1200., 760.),
+                (720., 420.),
+            ),
+        };
+        if let Some(window) = app.get_webview_window(label) {
+            window.show()?;
+            window.unminimize()?;
+            return window.set_focus();
+        }
+
+        let origin = url.origin();
+        let handle = app.clone();
+        let popup_handle = app.clone();
+        WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
+            .title(title)
+            .inner_size(size.0, size.1)
+            .min_inner_size(minimum.0, minimum.1)
+            .center()
+            .on_navigation(move |next| {
+                if next.origin() == origin {
+                    return true;
+                }
+                open_external(&handle, next);
+                false
+            })
+            .on_new_window(move |target, _| {
+                open_external(&popup_handle, &target);
+                NewWindowResponse::Deny
+            })
+            .build()?;
+        Ok(())
+    }
+
+    fn schedule(self, app: &AppHandle, mut url: tauri::Url) {
+        url.set_query(None);
+        url.set_fragment(None);
+        let app = app.clone();
+        // WebView2's navigation callback must return before creating another WebView.
+        // Dispatch from a worker because run_on_main_thread is synchronous on the UI thread.
+        tauri::async_runtime::spawn_blocking(move || {
+            let window_app = app.clone();
+            if let Err(error) = app.run_on_main_thread(move || {
+                if let Err(error) = self.open(&window_app, url) {
+                    window_app
+                        .dialog()
+                        .message(format!("Не удалось открыть окно. {error}"))
+                        .show(|_| {});
+                }
+            }) {
+                eprintln!("Не удалось запланировать открытие окна: {error}");
+            }
+        });
+    }
+}
+
 fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = app.path().resource_dir()?.join("runtime");
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
@@ -135,21 +227,33 @@ fn open_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         return Err("Шлюз вернул неверный локальный адрес".into());
     }
     let origin = url.origin();
+    let popup_origin = origin.clone();
     let handle = app.clone();
     let popup_handle = app.clone();
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
         .title(panel_title(app))
         .inner_size(440., 300.)
-        .min_inner_size(350., 300.)
+        .resizable(false)
+        .maximizable(false)
         .center()
         .on_navigation(move |next| {
             if next.origin() == origin {
+                if let Some(panel) = AuxiliaryPanel::from_url(next) {
+                    panel.schedule(&handle, next.clone());
+                    return false;
+                }
                 return true;
             }
             open_external(&handle, next);
             false
         })
         .on_new_window(move |target, _| {
+            if target.origin() == popup_origin {
+                if let Some(panel) = AuxiliaryPanel::from_url(&target) {
+                    panel.schedule(&popup_handle, target);
+                    return NewWindowResponse::Deny;
+                }
+            }
             open_external(&popup_handle, &target);
             NewWindowResponse::Deny
         })
@@ -217,34 +321,12 @@ fn main() {
         )
         .manage(Service::default())
         .manage(AtomicBool::new(false))
-        .menu(|app| {
-            let update =
-                MenuItem::with_id(app, "updates", "Проверить обновления…", true, None::<&str>)?;
-            let quit = PredefinedMenuItem::quit(app, Some("Завершить Naparnik Relay"))?;
-            let relay = Submenu::with_items(app, "Naparnik Relay", true, &[&update, &quit])?;
-            #[cfg(target_os = "macos")]
-            relay.insert(
-                &PredefinedMenuItem::close_window(app, Some("Закрыть окно"))?,
-                1,
-            )?;
-            let edit = Submenu::with_items(
-                app,
-                "Правка",
-                true,
-                &[
-                    &PredefinedMenuItem::cut(app, Some("Вырезать"))?,
-                    &PredefinedMenuItem::copy(app, Some("Копировать"))?,
-                    &PredefinedMenuItem::paste(app, Some("Вставить"))?,
-                    &PredefinedMenuItem::select_all(app, Some("Выбрать всё"))?,
-                ],
-            )?;
-            Menu::with_items(app, &[&relay, &edit])
-        })
+        .enable_macos_default_menu(false)
         .on_menu_event(|app, event| {
             match event.id().as_ref() {
                 "open-panel" => return show_panel(app),
                 "quit-relay" => return app.exit(0),
-                "updates" | "tray-update" => show_panel(app),
+                "tray-update" => show_panel(app),
                 _ => return,
             }
             if app.state::<AtomicBool>().swap(true, Ordering::SeqCst) {
@@ -263,13 +345,18 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.app_handle().tray_by_id("relay").is_some() && window.hide().is_ok() {
+                if window.label() == "main"
+                    && window.app_handle().tray_by_id("relay").is_some()
+                    && window.hide().is_ok()
+                {
                     api.prevent_close();
                     #[cfg(target_os = "macos")]
-                    let _ = window
-                        .app_handle()
-                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    hide_dock_when_idle(window.app_handle(), window.label());
                 }
+            }
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                hide_dock_when_idle(window.app_handle(), window.label());
             }
         })
         .setup(|app| {

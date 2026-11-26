@@ -36,7 +36,10 @@
       </div>
       <footer>
         <a href="https://ingvar.pro/?utm_source=naparnik_relay&amp;utm_medium=app&amp;utm_campaign=about" rel="noreferrer"><img src="/ingvar-consulting.png" width="111" height="20" alt="Ingvar Consulting" /></a>
-        <a class="quiet tools-link" href="#tools">Инструменты</a>
+        <nav class="panel-links" aria-label="Панели шлюза">
+          <a class="quiet" href="/tools.html" target="tools" rel="noopener">Настройки</a>
+          <a class="quiet" href="/trace.html" target="trace" rel="noopener">Трассировка</a>
+        </nav>
         <details id="quota">
           <summary aria-label="Лимиты Напарника">
             <svg viewBox="0 0 32 32" width="27" height="27" fill="none" aria-hidden="true">
@@ -76,18 +79,6 @@
           <label class="remember"><input id="remember" type="checkbox" checked>Запомнить на этом компьютере</label>
         </div>
       </form>
-    </main>
-    <main id="tools" hidden aria-labelledby="tools-title">
-      <header class="auth-heading"><a href="#home" class="back-link" aria-label="Назад">←</a><h1 id="tools-title" tabindex="-1">Инструменты</h1></header>
-      <label class="tool-session">Сессия <select id="tool-session"><option value="">Без сессии</option></select></label>
-      <div class="switch tool-sources" role="group" aria-label="Источник инструментов">
-        <button data-source="server" aria-pressed="true">Напарник</button>
-        <button data-source="OpenAI" aria-pressed="false">OpenAI</button>
-        <button data-source="Anthropic" aria-pressed="false">Anthropic</button>
-      </div>
-      <div class="tool-section"><h2 id="tool-kind">Вызовы на сервере</h2><span id="tool-total"></span></div>
-      <ul id="tool-list" tabindex="0" aria-labelledby="tool-kind"></ul>
-      <p id="tool-feedback" role="status">Загружаем инструменты…</p>
     </main>
     <div class="toast" id="toast" role="status"></div>
   </body>

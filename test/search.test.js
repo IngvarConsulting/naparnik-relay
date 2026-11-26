@@ -13,13 +13,19 @@ const answer = (uuid, content, tool_calls) => ({
 const delta = (uuid, content_delta) => ({ uuid, parent_uuid: null, role: null, finished: false, content: null, content_delta });
 const accepted = (id) => ({ tool_call_id: id, status: 'accepted', content: null });
 const result = (uuid, parent_uuid, id) => ({ uuid, parent_uuid, role: 'tool', finished: true, content: accepted(id), content_delta: null });
+const echo = (uuid, parent_uuid) => ({ uuid, parent_uuid, role: 'user', content: null, finished: true });
+const saved = ({ uuid, role, content }, parent_uuid) => ({ uuid, parent_uuid, role, content, create_time: '2026-08-25T10:00:00Z' });
 const event = (packet) => 'data: ' + JSON.stringify(packet) + '\n\n';
 const query = { messages: [{ role: 'user', content: 'Проверь по ИТС' }], tools: [] };
-function service(rounds) {
+function service(rounds, history = []) {
   const bridge = new Bridge();
   const posts = [];
   bridge.request = async (_key, path, body) => {
     if (path === '/conversations') return Response.json({ uuid: 'session' });
+    if (path === '/conversations/session') {
+      assert.equal(body, undefined);
+      return Response.json({ uuid: 'session', messages: history });
+    }
     assert.equal(path, '/conversations/session/messages');
     posts.push(body);
     const events = rounds.shift();
@@ -86,52 +92,80 @@ test('Подтверждение поиска следует UUID вызова �
   assert.deepEqual(posts[1], { role: 'tool', parent_uuid: 'a', no_generate: false, content: [accepted('s')] });
 });
 
-test('Дельта второго ответа без финала оставляет курсор на предыдущем ходе', async () => {
+test('После обрыва второго ответа история дополняет SSE без повтора первого ответа', async () => {
+  const first = answer('first', 'Первая часть.', []);
+  const second = answer('second', 'Вторая часть.', []);
   const { bridge, posts } = service([
     [answer('previous', 'Готово.', [])],
-    [answer('first', 'Первая часть.', []), delta('second', { content: 'Незавершённая часть.' })],
-    [answer('retry', 'Повтор завершён.', [])]
+    [echo('question', 'previous'), first, delta('second', { content: 'Незавершённая часть.' })],
+    [answer('next', 'Готово.', [])]
+  ], [
+    saved({ uuid: 'initial', role: 'user', content: query.messages[0].content }, null),
+    saved(answer('previous', 'Готово.', []), 'initial'),
+    saved({ uuid: 'question', role: 'user', content: 'Продолжай' }, 'previous'),
+    saved(first, 'question'),
+    saved(second, 'first')
   ]);
   const previous = await run(bridge);
   const next = { ...query, messages: [...query.messages, previous, { role: 'user', content: 'Продолжай' }] };
-  await assert.rejects(run(bridge, next), { code: 'incomplete_stream' });
-  assert.equal((await run(bridge, next)).content, 'Повтор завершён.');
-  assert.deepEqual(posts.slice(1).map((post) => post.parent_uuid), ['previous', 'previous']);
+  const parts = [];
+  const recovered = await run(bridge, next, new AbortController(), part => parts.push(part.content));
+  assert.deepEqual(parts, ['Первая часть.', '\n\nВторая часть.']);
+  assert.equal(recovered.content, parts.join(''));
+  await run(bridge, { ...query, messages: [{ role: 'user', content: 'Дальше' }] });
+  assert.deepEqual(posts.slice(1).map(post => post.parent_uuid), ['previous', 'second']);
 });
 
 test('Финал без завершающей пустой строки считается оборванным SSE-событием', async () => {
-  const partial = event(answer('first', 'Первая часть.', [])) + event(answer('second', 'Вторая часть.', [])).slice(0, -1);
-  const { bridge } = service([partial]);
-  await assert.rejects(run(bridge), { code: 'incomplete_stream' });
+  const partial = event(echo('question', null)) + event(answer('first', 'Ответ.', [])).slice(0, -1);
+  const { bridge } = service([partial], [
+    saved({ uuid: 'question', role: 'user', content: query.messages[0].content }, null)
+  ]);
+  await assert.rejects(run(bridge), { status: 409, code: 'recovery_pending' });
 });
 
-test('Обрыв потока во время работы серверного инструмента сохраняет прежний курсор', async () => {
+test('Обрыв потока во время поиска сохраняет курсор до появления результата в истории', async () => {
+  const requested = answer('requested', '', [call('s')]);
+  const history = [
+    saved({ uuid: 'initial', role: 'user', content: query.messages[0].content }, null),
+    saved(answer('prior', 'Earlier answer', []), 'initial'),
+    saved({ uuid: 'question', role: 'user', content: 'Проверь по ИТС' }, 'prior'),
+    saved(requested, 'question')
+  ];
   const { bridge, posts } = service([
     [answer('prior', 'Earlier answer', [])],
     [
-      answer('requested', '', [call('s')]),
+      echo('question', 'prior'),
+      requested,
       { uuid: '', finished: false, content: null, content_delta: { tool_call_id: 's', name: search } }
-    ],
-    [answer('retry', 'Retry answer', [])]
-  ]);
+    ]
+  ], history);
   await run(bridge);
-  await assert.rejects(run(bridge), { status: 502, code: 'incomplete_stream' });
+  await assert.rejects(run(bridge), { status: 409, code: 'recovery_pending' });
+  assert.equal(bridge.sessions.get(JSON.stringify(['OpenAI', 'search'])).parent, 'prior');
+  history.push(saved(result('tool-s', 'requested', 's'), 'requested'));
+  history.push(saved(answer('ready', 'Готовый результат.', []), 'tool-s'));
+  assert.equal((await run(bridge)).content, 'Готовый результат.');
   assert.equal(posts.length, 2);
-  await run(bridge);
-  assert.equal(posts[2].parent_uuid, 'prior');
 });
 
 test('Ошибка передачи SSE возвращается как незавершённый ответ', async () => {
   const bridge = new Bridge();
+  let historyAttempts = 0;
   bridge.request = async (_key, path) => {
     if (path === '/conversations') return Response.json({ uuid: 'chat' });
+    if (path === '/conversations/chat') {
+      historyAttempts++;
+      throw new Error('История недоступна');
+    }
     const stream = new ReadableStream({
       pull(controller) { controller.error(new TypeError('Connection reset')); }
     });
     return new Response(stream);
   };
   await assert.rejects(run(bridge), { status: 502, code: 'incomplete_stream' });
-  assert.equal(bridge.sessions.size, 0);
+  assert.equal(historyAttempts, 1);
+  assert.equal(bridge.sessions.get(JSON.stringify(['OpenAI', 'search'])).parent, null);
 });
 
 test('Отмена и повтор идентификатора прерывают поиск', async () => {
