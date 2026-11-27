@@ -6,6 +6,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { createServer } from '../server.js';
+import { normalize } from '../bridge.js';
+
+test('Anthropic принимает системное сообщение после пользовательского запроса', () => {
+  const user = { role: 'user', content: 'Проверка связи' };
+  const system = { role: 'system', content: [{ type: 'text', text: 'Ответь коротко.' }] };
+  assert.deepEqual(normalize({ model: 'naparnik', messages: [user, system] }, true).messages, [
+    user, { role: 'system', content: 'Ответь коротко.' }
+  ]);
+
+  const assistant = { role: 'assistant', content: 'Предыдущий ответ' };
+  assert.throws(() => normalize({ model: 'naparnik', messages: [user, assistant, system] }, true),
+    /Завершите историю/);
+});
 
 test('Оба клиента, ключи, история, поток и ошибки', async (t) => {
   const received = [],

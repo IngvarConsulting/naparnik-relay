@@ -159,8 +159,9 @@ export function normalize(body, anthropic, harnessSessionId) {
       messages.push(clientResult(msg.tool_call_id, msg));
     } else messages.push({ role: msg.role, content: textContent(msg.content) });
   }
+  const lastTurn = anthropic ? messages.findLast(message => message.role !== 'system') : messages.at(-1);
   requireInput(
-    ['user', 'tool'].includes(messages.at(-1)?.role),
+    ['user', 'tool'].includes(lastTurn?.role),
     'Завершите историю запросом пользователя или результатом инструмента.'
   );
   const supplied = choice === 'none' ? [] : (body.tools ?? []);

@@ -42,12 +42,13 @@ npm run dev
 
 ## Настройка клиентов
 
-Скопируйте **локальный API key** из панели. Оба профиля используют модель `naparnik`. Это локальное имя движка 1С.
+Скопируйте **локальный API key** из панели и выберите модель `naparnik`. Это локальное имя движка 1С.
 
 | Клиент | Протокол | Base URL по умолчанию |
 | --- | --- | --- |
 | [ZCode](docs/clients.md#zcode) | OpenAI Chat Completions | `http://127.0.0.1:47831/v1` |
 | [DeepSeek Harness](docs/clients.md#deepseek-harness) | Anthropic Messages | `http://127.0.0.1:47831` |
+| [Claude Code](docs/clients.md#claude-code) | Anthropic Messages | `http://127.0.0.1:47831` |
 
 [Инструкция по подключению клиентов](docs/clients.md) включает проверку новой сессии и настройку веб-инструментов DeepSeek Harness.
 
