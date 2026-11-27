@@ -180,7 +180,12 @@ export function normalize(body, anthropic, harnessSessionId) {
 const responseTraces = new WeakMap();
 const packetSources = new WeakMap();
 
-async function* packets(stream, signal, trace, clientToolNames) {
+function isAssistantDraft(packet) {
+  return Boolean(packet?.uuid && !packet.finished && packet.content_delta &&
+    (packet.role == null || packet.role === 'assistant'));
+}
+
+async function* packets(stream, signal, trace, clientToolNames, drafts) {
   const decoder = new TextDecoder();
   const done = Symbol();
   let buffer = '',
@@ -203,7 +208,12 @@ async function* packets(stream, signal, trace, clientToolNames) {
           toolScope = serverCalls.length === calls.length ? 'server' : serverCalls.length ? 'mixed' : 'client';
           serverToolIds = serverCalls.map(call => call.id).filter(id => typeof id === 'string' && id);
         }
-        const id = trace.exchange.record('upstream', { kind: 'sse', body: packet, call: trace.call, toolScope, serverToolIds });
+        // Each yielded packet updates the unfinished set before the next packet is parsed.
+        const draftTracked = isAssistantDraft(packet) && !packet.error_type && !packet.error
+          ? !drafts.has(packet.uuid) : undefined;
+        const id = trace.exchange.record('upstream', {
+          kind: 'sse', body: packet, call: trace.call, toolScope, serverToolIds, draftTracked
+        });
         if (isObject(packet) && id) packetSources.set(packet, id);
       }
       return packet;
@@ -260,6 +270,21 @@ function upstreamFault(status, data) {
   const code = data?.error_type || 'upstream_error';
   return new Fault(status, code, errorMessages[code] || 'Ошибка Напарника (' + code + ').');
 }
+
+function transportFailure(error, timeout) {
+  const cause = error?.cause?.code ?? error?.code;
+  const code = typeof cause === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(cause) ? cause : 'connection_error';
+  if (timeout.aborted || ['UND_ERR_CONNECT_TIMEOUT', 'ETIMEDOUT'].includes(code))
+    return { code: code === 'connection_error' ? 'ETIMEDOUT' : code, message: 'Истекло время ожидания ответа Напарника.' };
+  if (['ENOTFOUND', 'EAI_AGAIN', 'ENODATA'].includes(code))
+    return { code, message: 'Не удалось определить адрес Напарника (DNS).' };
+  if (/^(ERR_TLS_|ERR_SSL_|CERT_|SELF_SIGNED_|DEPTH_ZERO_|UNABLE_TO_)/.test(code))
+    return { code, message: 'Не удалось установить защищённое соединение (TLS). Проверьте сертификат.' };
+  if (code === 'ECONNREFUSED') return { code, message: 'Сервер отклонил соединение.' };
+  if (code === 'ECONNRESET' || code === 'UND_ERR_SOCKET') return { code, message: 'Соединение закрылось во время проверки.' };
+  return { code, message: 'Не удалось получить ответ от Напарника.' };
+}
+
 const tokenCount = n => Number.isSafeInteger(n) && n >= 0;
 function providerUsage(value) {
   if (!value || ![value.prompt_tokens, value.completion_tokens, value.total_tokens].every(tokenCount)) return null;
@@ -500,11 +525,12 @@ export class Bridge {
     try {
       const url = new URL(this.base + path);
       call = exchange?.record('upstream', {
-        kind: 'request', method, path: url.pathname + url.search, body, source: exchange.requestId
+        kind: 'request', method, path: exchange.authorization ? url.origin + url.pathname : url.pathname + url.search,
+        body, source: exchange.requestId
       });
       response = await fetch(url, {
         method,
-        redirect: 'error',
+        redirect: exchange?.authorization ? 'manual' : 'error',
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
         headers: {
           Authorization: 'Bearer ' + key,
@@ -513,8 +539,9 @@ export class Bridge {
         },
         body: JSON.stringify(body)
       });
-    } catch {
-      exchange?.record('upstream', { kind: 'error', call, body: 'Нет связи с Напарником.' });
+    } catch (error) {
+      exchange?.record('upstream', { kind: 'error', call,
+        body: exchange.authorization ? transportFailure(error, timeout) : 'Нет связи с Напарником.' });
       throw new Fault(503, 'connection_error', 'Нет связи с Напарником. Проверьте сеть и повторите запрос.');
     }
     if (exchange) {
@@ -525,22 +552,35 @@ export class Bridge {
       } else {
         const json = response.json.bind(response);
         response.json = async () => {
+          let text;
           try {
-            const data = await json();
+            if (exchange.authorization) text = await response.text();
+            const data = exchange.authorization ? JSON.parse(text) : await json();
             trace.response = exchange.record('upstream', { kind: 'response', call, status: response.status, body: data });
             return data;
           } catch (error) {
-            exchange.record('upstream', { kind: 'error', call, status: response.status, body: 'Не удалось прочитать ответ JSON.' });
+            if (text !== undefined) {
+              trace.response = exchange.record('upstream', { kind: 'response', call, status: response.status, body: text });
+            } else {
+              exchange.record('upstream', { kind: 'error', call, status: response.status,
+                body: exchange.authorization ? transportFailure(error, timeout) : 'Не удалось прочитать ответ JSON.' });
+            }
             throw error;
           }
         };
       }
     }
-    if (!response.ok) throw upstreamFault(response.status, await response.json().catch(() => ({})));
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      if (exchange?.authorization && [301, 302, 303, 307, 308].includes(response.status))
+        throw new Fault(502, 'unexpected_redirect', 'Сервер перенаправил запрос проверки API-ключа.');
+      throw upstreamFault(response.status, data);
+    }
     return response;
   }
   async budget(key, signal) {
-    const { limits } = await (await this.request(key, '/budget', undefined, signal)).json();
+    const response = await this.request(key, '/budget', undefined, signal);
+    const { limits } = await response.json().catch(() => ({})) ?? {};
     if (![limits?.sliding_5h, limits?.weekly].every((x) => Number.isFinite(x?.used_percent)))
       throw new Fault(502, 'bad_budget', 'Напарник вернул неизвестный формат лимитов.');
     return limits;
@@ -1070,7 +1110,7 @@ export class Bridge {
       const response = await this.request(key, '/conversations/' + encodeURIComponent(conversation) + '/messages',
         body, signal, true);
       received = true;
-      for await (const packet of packets(response.body, signal, responseTraces.get(response), clientToolNames)) {
+      for await (const packet of packets(response.body, signal, responseTraces.get(response), clientToolNames, drafts)) {
         if (packet.error_type || packet.error)
           throw upstreamFault(upstreamErrorStatuses.get(packet.error_type) ?? 502, packet);
         if (!packet.uuid) {
@@ -1080,7 +1120,7 @@ export class Bridge {
             saveProgress();
           }
         } else if (!packet.finished) {
-          if (packet.content_delta && (packet.role == null || packet.role === 'assistant') && !drafts.has(packet.uuid)) {
+          if (isAssistantDraft(packet) && !drafts.has(packet.uuid)) {
             drafts.add(packet.uuid);
             saveProgress();
           }
@@ -1203,7 +1243,7 @@ export class Bridge {
         const source = packetSources.get(p);
         if (!p.uuid) continue;
         if (!p.finished) {
-          if (!body.no_generate && p.content_delta && (p.role == null || p.role === 'assistant')) onDraft?.(source);
+          if (!body.no_generate && isAssistantDraft(p)) onDraft?.(source);
           continue;
         }
         parent = p.uuid;

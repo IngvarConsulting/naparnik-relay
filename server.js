@@ -8,13 +8,15 @@ import { join } from 'node:path';
 import { SessionTitles } from './session-titles.js';
 import { ToolMonitor } from './tool-monitor.js';
 import { serverToolEnabled, serverToolOptions } from './server-tools.js';
-import { runTrace, TraceStore } from './trace-store.js';
+import { redactTraceText, runTrace, TraceStore } from './trace-store.js';
 import { load, save, port, origin, dir, SessionBindings } from './state.js';
 
 const assets = new Map([
   ['/', ['index.html', 'text/html']],
   ['/app.js', ['app.js', 'text/javascript']],
   ['/panel.js', ['panel.js', 'text/javascript']],
+  ['/auth-diagnostics.html', ['auth-diagnostics.html', 'text/html']],
+  ['/auth-diagnostics.js', ['auth-diagnostics.js', 'text/javascript']],
   ['/tools.html', ['tools.html', 'text/html']],
   ['/tools.js', ['tools.js', 'text/javascript']],
   ['/trace.html', ['trace.html', 'text/html']],
@@ -69,6 +71,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
   const conversationQueue = new Map();
   const traces = new TraceStore();
   const traceConversations = new Map();
+  const authorizationDiagnostics = new Map();
   function newBridge(key) {
     return new Bridge(upstream, key ? new SessionBindings(profileDir, key) : undefined, conversationQueue,
       name => serverToolEnabled(connection.serverTools, name));
@@ -96,8 +99,29 @@ export function createServer({ connection = load(), upstream, persist = save, mo
   const authProblem = (e) => ({
     status: e.status || 503,
     code: e.code || 'connection_error',
-    message: e.message
+    message: e.message,
+    ...(e.diagnosticId && { diagnosticId: e.diagnosticId })
   });
+  async function checkAuthorization(candidate) {
+    const secrets = [candidate, connection.localKey, connection.admin, key, cookie.split('=')[1]]
+      .filter(value => typeof value === 'string' && value.length).sort((a, b) => b.length - a.length);
+    const capture = new TraceStore({ maxPacketBytes: 16 * 1024, maxSideBytes: 36 * 1024 });
+    const exchange = capture.begin({ authorization: true, secrets });
+    try {
+      requireInput(candidate.length && !/\s/.test(candidate), 'Введите API-ключ без пробелов.');
+      return await runTrace(exchange, () => bridge.budget(candidate));
+    } catch (e) {
+      const failure = e instanceof Fault ? e : new Fault(500, 'internal_error', 'Не удалось проверить API-ключ.');
+      const status = failure.status;
+      const code = redactTraceText(String(failure.code), secrets).slice(0, 128);
+      const message = redactTraceText(failure.message, secrets).slice(0, 512);
+      const id = exchange.sessionId;
+      const { time, upstream: packets } = capture.snapshot(id).exchanges[0];
+      authorizationDiagnostics.set(id, { time, error: { status, code, message }, packets });
+      if (authorizationDiagnostics.size > 12) authorizationDiagnostics.delete(authorizationDiagnostics.keys().next().value);
+      throw Object.assign(new Fault(status, code, message), { diagnosticId: id });
+    }
+  }
   function reset() {
     revision++;
     accountLifetime.abort();
@@ -114,7 +138,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
     const generation = revision;
     refresh = (async () => {
       try {
-        const value = await bridge.budget(key);
+        const value = await checkAuthorization(key);
         if (revision === generation) {
           limits = value;
           problem = null;
@@ -227,6 +251,12 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           const selector = new URLSearchParams(req.url.slice(path.length)).get('session');
           return send(traces.snapshot(selector));
         }
+        if (path === '/panel/auth-diagnostics' && method === 'GET') {
+          const id = new URLSearchParams(req.url.slice(path.length)).get('attempt');
+          const diagnostic = authorizationDiagnostics.get(id);
+          if (!diagnostic) throw new Fault(404, 'not_found', 'Запись проверки авторизации недоступна.');
+          return send(diagnostic);
+        }
         if (path === '/panel/state' && method === 'GET') return send(status());
         if (path === '/panel/refresh' && method === 'POST') {
           await check();
@@ -246,11 +276,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
             } else {
               const input = await body(req),
                 candidate = typeof input?.key === 'string' ? input.key.trim() : '';
-              requireInput(
-                typeof candidate === 'string' && candidate.length && !/\s/.test(candidate),
-                'Введите API-ключ без пробелов.'
-              );
-              const value = await bridge.budget(candidate);
+              const value = await checkAuthorization(candidate);
               const next = { ...connection, upstream: input.remember ? candidate : '' };
               persist(next);
               connection = next;
@@ -436,7 +462,7 @@ export function createServer({ connection = load(), upstream, persist = save, mo
           status === 403 ? 'permission_error' : 'invalid_request_error';
         error = { error: { message: msg, type, param: null, code } };
       } else {
-        error = { error: { message: msg, type: code, code } };
+        error = { error: { message: msg, type: code, code, ...(e.diagnosticId && { diagnosticId: e.diagnosticId }) } };
       }
       if (res.headersSent) {
         trace?.record('client', { kind: 'sse', event: anthropic ? 'error' : undefined, body: error });

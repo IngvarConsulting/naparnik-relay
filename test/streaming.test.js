@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { createServer } from '../server.js';
+import { draftStatus } from '../public/trace-links.js';
 
 const uuid = 'stream-answer';
 const conversation = '141f1fc8-3d60-4597-ae5c-61b3ca352f04';
@@ -15,7 +16,7 @@ const finalArguments = '{"ready": "right"}';
 const finalReasoning = 'confirmed reasoning';
 const provisional = /draft|secret|wrong|relay_preview/;
 
-async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } = {}) {
+async function fixture(t, { waitForFinal = Promise.resolve(), complete = true, twoMessages = false } = {}) {
   const sent = [];
   const listen = async server => {
     server.listen(0, '127.0.0.1');
@@ -61,6 +62,11 @@ async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } 
         ]
       } });
     }
+    if (twoMessages) {
+      send({ uuid: 'second-answer', finished: false, content_delta: { content: 'draft' } });
+      send({ uuid: 'second-answer', finished: false, content_delta: { content: 'draft again' } });
+      send({ uuid: 'second-answer', role: 'assistant', finished: true, content: { content: 'Second' } });
+    }
     res.end();
   });
   const upstreamUrl = await listen(upstream);
@@ -88,7 +94,20 @@ async function fixture(t, { waitForFinal = Promise.resolve(), complete = true } 
           [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }]
       })
     });
-  return { post, sent };
+  const trace = async () => {
+    const headers = { 'Content-Type': 'application/json', 'X-Relay-Panel': '1' };
+    const auth = await fetch(base + '/panel/session', { method: 'POST', headers,
+      body: JSON.stringify({ token: 'admin-fixture' }) });
+    assert.equal(auth.status, 200);
+    headers.Cookie = auth.headers.get('set-cookie').split(';')[0];
+    const { sessions } = await (await fetch(base + '/panel/trace', { headers })).json();
+    assert.equal(sessions.length, 1);
+    const { exchanges } = await (await fetch(base + '/panel/trace?session=' + encodeURIComponent(sessions[0].id),
+      { headers })).json();
+    assert.equal(exchanges.length, 1);
+    return exchanges[0];
+  };
+  return { post, sent, trace };
 }
 
 async function* frames(stream) {
@@ -223,6 +242,23 @@ test('Без SSE оба протокола возвращают целиком �
     }
     assert.doesNotMatch(JSON.stringify(data), provisional);
   }
+});
+
+test('Трассировка отличает контроль финала нового UUID от повторной дельты', async t => {
+  const { post, trace } = await fixture(t, { twoMessages: true });
+  const response = await post(true);
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(await response.text(), provisional);
+  const { client, upstream } = await trace();
+  const drafts = upstream.filter(packet => packet.body?.content_delta);
+  assert.deepEqual(drafts.map(packet => [packet.body.uuid, packet.draftTracked]), [
+    [uuid, true], [uuid, false], ['second-answer', true], ['second-answer', false]
+  ]);
+  const source = client.find(packet => packet.event === 'message_start')?.source;
+  assert.equal(source, drafts[0].id);
+  assert.ok(drafts.slice(1).every(draft => !client.some(packet => packet.source === draft.id)));
+  assert.deepEqual(drafts.map(packet => draftStatus(packet, source)), ['start', 'skip', 'tracked', 'skip']);
+  assert.equal(draftStatus({ kind: 'sse', body: drafts[3].body }), 'draft');
 });
 
 test('В обоих протоколах возвращённое рассуждение не меняет ветку и отбрасывается при импорте истории', async t => {

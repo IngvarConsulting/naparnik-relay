@@ -259,6 +259,7 @@ fn panel_title(app: &AppHandle) -> String {
 enum AuxiliaryPanel {
     Tools,
     Trace,
+    AuthDiagnostics,
 }
 
 impl AuxiliaryPanel {
@@ -266,6 +267,7 @@ impl AuxiliaryPanel {
         match url.path() {
             "/tools.html" => Some(Self::Tools),
             "/trace.html" => Some(Self::Trace),
+            "/auth-diagnostics.html" => Some(Self::AuthDiagnostics),
             _ => None,
         }
     }
@@ -284,8 +286,17 @@ impl AuxiliaryPanel {
                 (1200., 760.),
                 (720., 420.),
             ),
+            Self::AuthDiagnostics => (
+                "auth-diagnostics",
+                "Диагностика авторизации · Naparnik Relay",
+                (680., 500.),
+                (360., 300.),
+            ),
         };
         if let Some(window) = app.get_webview_window(label) {
+            if matches!(self, Self::AuthDiagnostics) && window.url()? != url {
+                window.navigate(url)?;
+            }
             window.show()?;
             window.unminimize()?;
             return window.set_focus();
@@ -314,8 +325,17 @@ impl AuxiliaryPanel {
     }
 
     fn schedule(self, app: &AppHandle, mut url: tauri::Url) {
+        let attempt = match self {
+            Self::AuthDiagnostics => url
+                .query_pairs()
+                .find_map(|(name, value)| (name == "attempt").then(|| value.into_owned())),
+            Self::Tools | Self::Trace => None,
+        };
         url.set_query(None);
         url.set_fragment(None);
+        if let Some(attempt) = attempt {
+            url.query_pairs_mut().append_pair("attempt", &attempt);
+        }
         let app = app.clone();
         // WebView2's navigation callback must return before creating another WebView.
         // Dispatch from a worker because run_on_main_thread is synchronous on the UI thread.

@@ -12,7 +12,9 @@ export async function panelRequest(path, method = 'GET', data, { keepalive = fal
   }
   const value = await response.json().catch(() => null);
   if (!response.ok || value === null) {
-    throw new Error(value?.error?.message || 'Шлюз вернул ошибку.');
+    const error = new Error(value?.error?.message || 'Шлюз вернул ошибку.');
+    if (typeof value?.error?.diagnosticId === 'string') error.diagnosticId = value.error.diagnosticId;
+    throw error;
   }
   return value;
 }

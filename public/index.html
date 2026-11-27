@@ -73,7 +73,10 @@
       <form id="account">
         <div class="key-label"><label for="secret">API-ключ Напарника</label><a href="https://code.1c.ai/api-access/" rel="noreferrer">Получить ключ ↗</a></div>
         <input id="secret" type="password" placeholder="Вставьте ключ" autocomplete="off" spellcheck="false" required>
-        <p class="error" id="error" role="alert"></p>
+        <div class="auth-error">
+          <p class="error" id="error" role="alert"></p>
+          <a id="auth-diagnostics" target="auth-diagnostics" rel="noopener" hidden>Подробнее</a>
+        </div>
         <div class="form-actions">
           <button type="submit" class="primary" id="connect">Подключить</button>
           <label class="remember"><input id="remember" type="checkbox" checked>Запомнить на этом компьютере</label>

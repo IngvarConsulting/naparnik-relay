@@ -4,6 +4,16 @@ export function isSavedUserMessage(packet) {
     body.content == null && body.content_delta == null;
 }
 
+export function draftStatus(packet, streamStartSource) {
+  const { draftTracked, body } = packet;
+  if (packet.kind !== 'sse' || (typeof draftTracked !== 'boolean' &&
+      !(body?.uuid && body.finished === false && body.content_delta && (body.role == null || body.role === 'assistant')))) return;
+  if (String(packet.id) === streamStartSource) return 'start';
+  if (draftTracked === true) return 'tracked';
+  if (draftTracked === false) return 'skip';
+  return 'draft';
+}
+
 function messageConversation(packet) {
   if (packet.kind !== 'request' || packet.method !== 'POST') return;
   return /\/conversations\/([^/?]+)\/messages(?:\?|$)/.exec(packet.path)?.[1].toLowerCase();

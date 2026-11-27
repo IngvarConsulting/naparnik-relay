@@ -1,5 +1,5 @@
 import { panelRequest } from './panel.js';
-import { exchangeLinks, isSavedUserMessage, serverToolLinks } from './trace-links.js';
+import { draftStatus, exchangeLinks, isSavedUserMessage, serverToolLinks } from './trace-links.js';
 import { linkedScroll, scrollAnchors } from './trace-scroll.js';
 import { renderPacketBody } from './trace-syntax.js';
 
@@ -24,6 +24,12 @@ const timeFormat = new Intl.DateTimeFormat('ru-RU', {
 });
 const dateFormat = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 const packetKinds = { request: 'Запрос', response: 'Ответ', sse: 'SSE', error: 'Ошибка', limit: 'Лимит трассировки' };
+const draftLabels = {
+  start: ['Старт потока', 'Эта дельта открыла клиентский SSE-поток.'],
+  tracked: ['Контроль финала', 'Relay учёл UUID сообщения при проверке завершения потока и восстановлении после обрыва.'],
+  skip: ['SKIP Draft', 'UUID уже учтён. Содержимое дельты агенту не передано.'],
+  draft: ['Черновик', 'В этой записи нет данных о том, был ли UUID учтён.']
+};
 let selected = null;
 let hovered, focused, selectedPacket;
 let highlighted = [];
@@ -218,10 +224,8 @@ function packetDetails({ packet, response, beginning }, side, opened, links, str
   if (beginning) details.dataset.beginningId = String(beginning.id);
   details.open = group.ids.some(id => opened.has(id));
   const payload = packet.body;
-  const draft = side === 'upstream' && packet.kind === 'sse' && payload?.uuid &&
-    payload.finished === false && payload.content_delta && (payload.role == null || payload.role === 'assistant');
-  const opensStream = draft && id === streamStartSource;
-  if (draft && !opensStream) details.classList.add('trace-packet-draft');
+  const draft = side === 'upstream' && draftStatus(packet, streamStartSource);
+  if (draft === 'skip') details.classList.add('trace-packet-draft');
   const summary = node('summary');
   const heading = node('span', null, 'trace-packet-heading');
   const purpose = side === 'upstream' && conversationPacketLabel(packet, serverToolSources);
@@ -236,11 +240,12 @@ function packetDetails({ packet, response, beginning }, side, opened, links, str
   }
   const hasRoute = packet.method || packet.path;
   if (hasRoute) heading.append(requestLine(packet));
-  if (opensStream) {
-    const label = node('span', 'Старт потока', 'trace-start-label');
-    label.title = 'Эта дельта открыла клиентский SSE-поток';
+  if (draft) {
+    const [caption, tooltip] = draftLabels[draft];
+    const label = node('span', caption, draft === 'start' ? 'trace-start-label' : 'trace-draft-label');
+    label.title = tooltip;
     heading.append(label);
-  } else if (draft) heading.append(node('span', 'SKIP Draft', 'trace-draft-label'));
+  }
   if (packet.kind === 'sse' && !purpose) {
     if (payload === '[DONE]') heading.append(node('span', 'DONE', 'trace-done-label'));
     const name = packet.event || (typeof packet.body === 'string'

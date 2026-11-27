@@ -83,16 +83,25 @@ for (const button of document.querySelectorAll('.copy'))
       toast('Браузер заблокировал буфер обмена. Разрешите копирование.');
     }
   };
+function showAuthError(message, diagnosticId) {
+  $('error').textContent = message || '';
+  const link = $('auth-diagnostics');
+  link.hidden = !diagnosticId;
+  if (diagnosticId) link.href = '/auth-diagnostics.html?attempt=' + encodeURIComponent(diagnosticId);
+  else link.removeAttribute('href');
+}
 function showPage() {
   const auth = location.hash === '#account' && Boolean(state);
   $('home').hidden = auth;
   $('auth').hidden = !auth;
   $('quota').open = false;
   $('account').reset();
-  $('error').textContent = '';
+  showAuthError();
   if (auth) {
     $('remember').checked = !state.configured || state.saved;
-    $('auth-state').textContent = state.problem?.message || (state.configured ? 'Аккаунт подключён' : 'Подключите аккаунт по API-ключу.');
+    $('auth-state').hidden = Boolean(state.problem);
+    $('auth-state').textContent = state.configured ? 'Аккаунт подключён' : 'Подключите аккаунт по API-ключу.';
+    showAuthError(state.problem?.message, state.problem?.diagnosticId);
     $('unlink').hidden = !state.configured;
     $('secret').placeholder = state.configured ? 'Введите новый ключ' : 'Вставьте ключ';
     $('connect').textContent = state.configured ? 'Заменить ключ' : 'Подключить';
@@ -116,7 +125,7 @@ document.addEventListener('keydown', event => {
 async function account(remove) {
   pending = true;
   $('connect').disabled = $('unlink').disabled = true;
-  $('error').textContent = '';
+  showAuthError();
   $('connect').textContent = remove ? 'Отключаем…' : 'Проверяем…';
   try {
     render(
@@ -130,7 +139,7 @@ async function account(remove) {
     location.hash = 'home';
     toast(remove ? 'Аккаунт отключён' : 'Аккаунт подключён');
   } catch (e) {
-    $('error').textContent = e.message;
+    showAuthError(e.message, e.diagnosticId);
   } finally {
     pending = false;
     $('connect').disabled = $('unlink').disabled = false;
