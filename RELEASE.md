@@ -1,9 +1,8 @@
-### Что нового в 1.0.13
+### Что нового в 1.0.14
 
-- Relay принимает запросы Anthropic Messages, в которых за сообщением пользователя или результатом инструмента следует служебное сообщение `system`. Это устраняет `HTTP 400` при запуске Claude Code с моделью `naparnik`.
-- Добавлена инструкция по подключению Claude Code для Windows, macOS и Linux. [Подключение Claude Code](https://github.com/IngvarConsulting/naparnik-relay/blob/v1.0.13/docs/clients.md#claude-code)
+- Перед вводом или заменой API-ключа Relay показывает памятку об условиях использования 1С:Напарника и передаче данных. Кнопка «Перейти к входу в 1С» открывает форму авторизации. [Пользовательское соглашение 1С](https://code.1c.ai/user_agreement/)
 
-Для подключения выберите `naparnik` у провайдера с адресом и ключом из панели Relay. [Инструкции для клиентов](https://github.com/IngvarConsulting/naparnik-relay/blob/v1.0.13/docs/clients.md)
+Для подключения выберите `naparnik` у провайдера с адресом и ключом из панели Relay. [Инструкции для клиентов](https://github.com/IngvarConsulting/naparnik-relay/blob/v1.0.14/docs/clients.md)
 
 ### Установка
 

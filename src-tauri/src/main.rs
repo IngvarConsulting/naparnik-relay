@@ -259,6 +259,7 @@ fn panel_title(app: &AppHandle) -> String {
 enum AuxiliaryPanel {
     Tools,
     Trace,
+    BeforeSignIn,
     AuthDiagnostics,
 }
 
@@ -267,6 +268,7 @@ impl AuxiliaryPanel {
         match url.path() {
             "/tools.html" => Some(Self::Tools),
             "/trace.html" => Some(Self::Trace),
+            "/before-sign-in.html" => Some(Self::BeforeSignIn),
             "/auth-diagnostics.html" => Some(Self::AuthDiagnostics),
             _ => None,
         }
@@ -285,6 +287,12 @@ impl AuxiliaryPanel {
                 "Трассировка · Naparnik Relay",
                 (1200., 760.),
                 (720., 420.),
+            ),
+            Self::BeforeSignIn => (
+                "before-sign-in",
+                "Перед входом в 1С:Напарник",
+                (700., 640.),
+                (420., 360.),
             ),
             Self::AuthDiagnostics => (
                 "auth-diagnostics",
@@ -311,6 +319,30 @@ impl AuxiliaryPanel {
             .center()
             .on_navigation(move |next| {
                 if handle.state::<Service>().serves(next) {
+                    if matches!(self, Self::BeforeSignIn)
+                        && next.path() == "/"
+                        && next.query().is_none()
+                        && matches!(next.fragment(), Some("account" | "home"))
+                    {
+                        let destination = next.clone();
+                        schedule_window_action(&handle, move |app| {
+                            if !app.state::<Service>().serves(&destination) {
+                                return Ok(());
+                            }
+                            let Some(notice) = app.get_webview_window(label) else {
+                                return Ok(());
+                            };
+                            let main = app
+                                .get_webview_window("main")
+                                .ok_or(tauri::Error::WindowNotFound)?;
+                            main.navigate(destination)?;
+                            main.show()?;
+                            main.unminimize()?;
+                            main.set_focus()?;
+                            notice.close()
+                        });
+                        return false;
+                    }
                     return true;
                 }
                 open_external(&handle, next);
@@ -329,30 +361,37 @@ impl AuxiliaryPanel {
             Self::AuthDiagnostics => url
                 .query_pairs()
                 .find_map(|(name, value)| (name == "attempt").then(|| value.into_owned())),
-            Self::Tools | Self::Trace => None,
+            Self::Tools | Self::Trace | Self::BeforeSignIn => None,
         };
         url.set_query(None);
         url.set_fragment(None);
         if let Some(attempt) = attempt {
             url.query_pairs_mut().append_pair("attempt", &attempt);
         }
-        let app = app.clone();
-        // WebView2's navigation callback must return before creating another WebView.
-        // Dispatch from a worker because run_on_main_thread is synchronous on the UI thread.
-        tauri::async_runtime::spawn_blocking(move || {
-            let window_app = app.clone();
-            if let Err(error) = app.run_on_main_thread(move || {
-                if let Err(error) = self.open(&window_app, url) {
-                    window_app
-                        .dialog()
-                        .message(format!("Не удалось открыть окно. {error}"))
-                        .show(|_| {});
-                }
-            }) {
-                eprintln!("Не удалось запланировать открытие окна: {error}");
-            }
-        });
+        schedule_window_action(app, move |app| self.open(app, url));
     }
+}
+
+fn schedule_window_action(
+    app: &AppHandle,
+    action: impl FnOnce(&AppHandle) -> tauri::Result<()> + Send + 'static,
+) {
+    let app = app.clone();
+    // WebView2's navigation callback must return before changing WebView windows.
+    // Dispatch from a worker because run_on_main_thread is synchronous on the UI thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let window_app = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            if let Err(error) = action(&window_app) {
+                window_app
+                    .dialog()
+                    .message(format!("Не удалось открыть окно. {error}"))
+                    .show(|_| {});
+            }
+        }) {
+            eprintln!("Не удалось запланировать открытие окна: {error}");
+        }
+    });
 }
 
 fn read_startup(

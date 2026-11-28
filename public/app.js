@@ -37,8 +37,10 @@ function render(data) {
   pick(profile);
   if (opening) {
     opening = false;
-    if (!data.configured || data.problem?.status === 401)
-      history.replaceState(null, '', '#account');
+    if (!location.hash && (!data.configured || data.problem?.status === 401)) {
+      history.replaceState(null, '', '#home');
+      openSignInNotice();
+    }
     if ($('auth').hidden) showPage();
   }
 }
@@ -111,7 +113,10 @@ function showPage() {
     $('manage').focus({preventScroll:true});
   }
 }
-$('manage').onclick = () => { location.hash = 'account'; };
+function openSignInNotice() {
+  location.assign('/before-sign-in.html');
+}
+$('manage').onclick = openSignInNotice;
 window.addEventListener('hashchange', showPage);
 document.addEventListener('click', event => {
   if (!$('quota').contains(event.target)) $('quota').open = false;

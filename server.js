@@ -15,6 +15,7 @@ const assets = new Map([
   ['/', ['index.html', 'text/html']],
   ['/app.js', ['app.js', 'text/javascript']],
   ['/panel.js', ['panel.js', 'text/javascript']],
+  ['/before-sign-in.html', ['before-sign-in.html', 'text/html']],
   ['/auth-diagnostics.html', ['auth-diagnostics.html', 'text/html']],
   ['/auth-diagnostics.js', ['auth-diagnostics.js', 'text/javascript']],
   ['/tools.html', ['tools.html', 'text/html']],
